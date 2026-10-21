@@ -1,0 +1,12 @@
+[package]
+name = "ygo-runner"
+version = "0.1.0"
+edition = "2021"
+description = "Duel runner on EDOPro's ygopro-core (our own FFI): random self-play and a remote-worker broker"
+
+[dependencies]
+rusqlite = "0.32"
+serde_json = "1"
+
+[profile.release]
+debug = 1
