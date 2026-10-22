@@ -34,7 +34,13 @@ pub struct Decision {
     pub player: u8,
     pub kind: &'static str,
     pub choices: Vec<Choice>,
+    /// Select/unselect (26) only: the card each "unselect" choice takes back, so the caller can stop it
+    /// from being picked again in the same selection (a fixed policy would otherwise toggle it forever).
+    pub unselects: Vec<Option<CardKey>>,
 }
+
+/// controller, location, sequence, code
+pub type CardKey = (u8, u8, u32, u32);
 
 pub struct Reader<'a> {
     b: &'a [u8],
@@ -112,11 +118,13 @@ fn push_unique(out: &mut Vec<Choice>, c: Choice) {
     }
 }
 
-pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng) -> Result<Decision, String> {
+/// `unselected`: cards taken back earlier in the current select/unselect sequence (not offered again).
+pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -> Result<Decision, String> {
     let t = msg[0];
     let mut r = Reader::new(&msg[1..]);
     let player = r.u8()?;
     let mut ch: Vec<Choice> = Vec::new();
+    let mut unselects: Vec<Option<CardKey>> = Vec::new();
     let kind: &'static str;
     match t {
         10 => {
@@ -415,32 +423,56 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng) -> Result<Decision, Strin
             }
         }
         26 => {
+            // Unselect is offered only when nothing can be selected, and a card taken back is not offered
+            // again in the same selection, so a fixed policy cannot toggle one card forever.
             kind = "select or unselect a card";
             let finishable = r.u8()? != 0;
             let cancelable = r.u8()? != 0;
             r.u32()?;
             r.u32()?;
-            let n1 = r.u32()?;
             let mut i = 0i32;
+            let mut sel: Vec<(Choice, CardKey)> = Vec::new();
+            let n1 = r.u32()?;
             for _ in 0..n1 {
                 let code = r.u32()?;
-                let (con, loc, _) = r.loc_info()?;
+                let (con, loc, seq) = r.loc_info()?;
                 let mut resp = i32r(1);
                 resp.extend(i32r(i));
-                ch.push(Choice { text: format!("select {}", card_text(lib, code, player, con, loc)), resp });
+                sel.push((Choice { text: format!("select {}", card_text(lib, code, player, con, loc)), resp }, (con, loc, seq, code)));
                 i += 1;
             }
+            let mut unsel: Vec<(Choice, CardKey)> = Vec::new();
             let n2 = r.u32()?;
             for _ in 0..n2 {
                 let code = r.u32()?;
-                let (con, loc, _) = r.loc_info()?;
+                let (con, loc, seq) = r.loc_info()?;
                 let mut resp = i32r(1);
                 resp.extend(i32r(i));
-                ch.push(Choice { text: format!("unselect {}", card_text(lib, code, player, con, loc)), resp });
+                unsel.push((Choice { text: format!("unselect {}", card_text(lib, code, player, con, loc)), resp }, (con, loc, seq, code)));
                 i += 1;
+            }
+            let (fresh, stale): (Vec<(Choice, CardKey)>, Vec<(Choice, CardKey)>) =
+                sel.into_iter().partition(|(_, k)| !unselected.contains(k));
+            if !fresh.is_empty() {
+                for (c, _) in fresh {
+                    ch.push(c);
+                    unselects.push(None);
+                }
+            } else if !(finishable || cancelable) {
+                for (c, k) in unsel {
+                    ch.push(c);
+                    unselects.push(Some(k));
+                }
             }
             if finishable || cancelable {
                 ch.push(Choice { text: if finishable { "finish selecting".into() } else { "cancel".into() }, resp: i32r(-1) });
+                unselects.push(None);
+            }
+            if ch.is_empty() {
+                for (c, _) in stale {
+                    ch.push(c);
+                    unselects.push(None);
+                }
             }
         }
         132 => {
@@ -488,7 +520,8 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng) -> Result<Decision, Strin
         }
         _ => return Err(format!("unhandled decision message {t}")),
     }
-    Ok(Decision { msg: t, player, kind, choices: ch })
+    unselects.resize(ch.len(), None);
+    Ok(Decision { msg: t, player, kind, choices: ch, unselects })
 }
 
 /// select_sum_check1 from playerop.cpp: every card uses one of its two values and they add up to acc exactly.

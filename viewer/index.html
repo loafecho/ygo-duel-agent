@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duel Replays</title>
+<style>
+:root {
+  --bg: #f4f1ea; --panel: #fffdf8; --ink: #1f1d1a; --muted: #6b665d; --line: #ddd6c8;
+  --felt: #2f5d50; --felt-ink: #eef4ef; --zone: rgba(255,255,255,.10); --zone-line: rgba(255,255,255,.22);
+  --monster: #c98a3a; --spell: #2f8f7f; --trap: #a2477a; --down: #4a4f63; --accent: #b4462f; --win: #2e7d4f; --loss: #b4462f;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171a; --panel: #1d2024; --ink: #ebe7df; --muted: #9a958b; --line: #30343a;
+    --felt: #1f3f37; --felt-ink: #e3ece6; --zone: rgba(255,255,255,.06); --zone-line: rgba(255,255,255,.16);
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: baseline; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { margin: 0; font-size: 18px; }
+header .sub { color: var(--muted); }
+main { padding: 16px; max-width: 1400px; margin: 0 auto; }
+table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
+.w { color: var(--win); font-weight: 600; } .l { color: var(--loss); font-weight: 600; }
+.wrap { overflow-x: auto; }
+#game { display: none; }
+.top { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 12px; }
+button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+button:hover { border-color: var(--accent); }
+input[type=range] { flex: 1; min-width: 160px; accent-color: var(--accent); }
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 14px; }
+@media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+.board { background: var(--felt); color: var(--felt-ink); border-radius: 10px; padding: 12px; }
+.side { padding: 8px 0; }
+.side + .side { border-top: 2px dashed var(--zone-line); }
+.who { display: flex; justify-content: space-between; align-items: baseline; font-weight: 600; margin-bottom: 6px; }
+.lp { font-variant-numeric: tabular-nums; font-size: 18px; }
+.row { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; margin: 6px 0; }
+.label { font-size: 11px; opacity: .7; margin-top: 4px; text-transform: uppercase; letter-spacing: .05em; }
+.slot { min-height: 74px; border: 1px dashed var(--zone-line); border-radius: 6px; background: var(--zone); padding: 4px; font-size: 11px; overflow: hidden; }
+.card { border-radius: 5px; padding: 4px 5px; min-height: 64px; color: #fff; display: flex; flex-direction: column; justify-content: space-between; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+.card .n { font-weight: 600; font-size: 11px; line-height: 1.15; overflow-wrap: anywhere; }
+.card .s { font-size: 10px; opacity: .9; font-variant-numeric: tabular-nums; }
+.m { background: var(--monster); } .sp { background: var(--spell); } .tr { background: var(--trap); }
+.down { background: repeating-linear-gradient(45deg, var(--down), var(--down) 6px, #5a6075 6px, #5a6075 12px); }
+.def { transform: rotate(-4deg); outline: 2px solid rgba(255,255,255,.5); }
+.hand { display: flex; flex-wrap: wrap; gap: 6px; }
+.hand .card { width: 92px; }
+.piles { font-size: 12px; opacity: .85; margin-top: 4px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+.panel h2 { font-size: 15px; margin: 0 0 6px; }
+.meta { color: var(--muted); margin-bottom: 8px; }
+ol.opts { margin: 0; padding-left: 0; list-style: none; }
+ol.opts li { padding: 5px 7px; border-radius: 5px; margin: 2px 0; border: 1px solid transparent; }
+ol.opts li.pick { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); font-weight: 600; }
+.k { font-family: ui-monospace, monospace; color: var(--muted); margin-right: 6px; }
+.end { font-size: 16px; font-weight: 700; }
+</style>
+</head>
+<body>
+<header><h1>Duel Replays</h1><button id="liveBtn" style="margin-left:auto;order:3">● Live</button><span class="sub" id="sub">ygo-duel-agent · game host</span></header>
+<main>
+  <section id="list">
+    <div class="wrap"><table>
+      <thead><tr><th>Finished</th><th>Run</th><th>Player 0</th><th>Player 1</th><th>Result</th><th>Turns</th><th>Moves</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="7">Loading…</td></tr></tbody>
+    </table></div>
+  </section>
+  <section id="live" style="display:none">
+    <div class="top"><button id="liveBack">← Games</button><span id="liveTabs"></span><span id="liveInfo" class="meta"></span></div>
+    <div class="layout"><div class="board" id="liveBoard"></div><div class="panel" id="liveStep"></div></div>
+  </section>
+  <section id="game">
+    <div class="top">
+      <button id="back">← Games</button>
+      <button id="prev">◀</button>
+      <button id="play">Play</button>
+      <button id="next">▶</button>
+      <input type="range" id="slider" min="0" value="0">
+      <span id="pos"></span>
+    </div>
+    <div class="layout">
+      <div class="board" id="board"></div>
+      <div class="panel" id="step"></div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let G = null, boards = [], idx = 0, timer = null;
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+const REASONS = {"0": "surrender", "1": "life points hit 0", "2": "deck ran out"};
+const reasonText = (r) => REASONS[r] ?? (/^\d+$/.test(String(r)) ? `special win ${r}` : r ?? "");
+function when(t) { return t ? new Date(t * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "numeric", minute: "2-digit"}) : ""; }
+function result(g) {
+  if (g.winner === 0) return '<span class="w">Player 0 won</span>';
+  if (g.winner === 1) return '<span class="l">Player 1 won</span>';
+  return '<span class="tag">draw</span>';
+}
+
+async function loadList() {
+  const games = await (await fetch("api/games")).json();
+  $("sub").textContent = `${games.length} saved games · ygo-duel-agent · game host`;
+  $("rows").innerHTML = games.length ? games.map((g) => `<tr data-f="${esc(g.file)}">
+    <td>${when(g.finished)}</td><td>${esc(g.name)}</td><td><span class="tag">${esc(g.seats[0])}</span></td>
+    <td><span class="tag">${esc(g.seats[1])}</span></td><td>${result(g)} <span class="meta">${esc(reasonText(g.reason))}</span></td>
+    <td>${g.turns}</td><td>${g.steps}</td></tr>`).join("") : '<tr><td colspan="7">No replays yet.</td></tr>';
+  for (const tr of $("rows").querySelectorAll("tr[data-f]")) tr.onclick = () => openGame(tr.dataset.f);
+}
+
+async function openGame(file) {
+  G = await (await fetch("replays/" + encodeURIComponent(file))).json();
+  boards = []; let last = null;
+  for (const s of G.steps) { if (s.board) last = s.board; boards.push(last); }
+  $("list").style.display = "none"; $("game").style.display = "block";
+  $("slider").max = G.steps.length - 1;
+  history.replaceState(null, "", "#" + file);
+  const at = parseInt(new URLSearchParams(location.search).get("step") ?? "0", 10);
+  show(Math.min(Math.max(at, 0), G.steps.length - 1));
+}
+
+function cardHtml(c, zone) {
+  if (!c) return "";
+  const [code, pos, atk, def, pub, type] = c;
+  const name = G.names[code] ?? code;
+  const faceDown = (pos & 0xA) !== 0;
+  let cls = type & 1 ? "m" : type & 2 ? "sp" : type & 4 ? "tr" : "m";
+  if (faceDown && zone !== "hand") cls = "down";
+  const defense = zone === "m" && (pos & 0xC) !== 0;
+  const stats = type & 1 && zone !== "s" ? `${atk}/${def}` : type & 2 ? "Spell" : type & 4 ? "Trap" : "";
+  const state = faceDown && zone !== "hand" ? "set · " : "";
+  return `<div class="card ${cls}${defense ? " def" : ""}" title="${esc(name)}"><div class="n">${esc(name)}</div><div class="s">${state}${stats}</div></div>`;
+}
+
+function sideHtml(b, p) {
+  const s = b.sides[p];
+  const slots = (arr, zone) => Array.from({length: 7}, (_, i) => `<div class="slot">${cardHtml(arr[i], zone)}</div>`).join("");
+  const grave = s.grave.map((c) => G.names[c[0]] ?? c[0]);
+  return `<div class="side">
+    <div class="who"><span>Player ${p}${b.turn_player === p ? " · turn player" : ""} · ${esc(G.seats[p])}</span><span class="lp">${b.lp[p]} LP</span></div>
+    <div class="label">Hand (${s.hand.length})</div><div class="hand">${s.hand.map((c) => cardHtml(c, "hand")).join("") || '<span class="piles">empty</span>'}</div>
+    <div class="label">Monsters (zones 1–5, extra 1–2)</div><div class="row">${slots(s.mzone, "m")}</div>
+    <div class="label">Spells / traps (zones 1–5, field, pendulum)</div><div class="row">${slots(s.szone, "s")}</div>
+    <div class="piles">Deck ${s.deck} · Extra ${s.extra} · Banished ${s.banished.length} · Graveyard (${grave.length}): ${esc(grave.join(", ") || "empty")}</div>
+  </div>`;
+}
+
+function show(i) {
+  idx = i; const s = G.steps[i], b = boards[i];
+  $("slider").value = i; $("pos").textContent = `move ${i + 1} / ${G.steps.length}`;
+  $("board").innerHTML = b ? sideHtml(b, 1) + sideHtml(b, 0) : "";
+  const head = `<div class="meta">Turn ${b?.turn ?? "?"} · ${esc(b?.phase ?? "")} · seed ${G.seed}</div>`;
+  if (s.end) {
+    const w = s.winner === -1 ? "Draw" : `Player ${s.winner} (${esc(G.seats[s.winner])}) wins`;
+    $("step").innerHTML = `<h2>Game over</h2>${head}<div class="end">${w}</div><div class="meta">${esc(reasonText(G.reason))} · ${G.turns} turns · LP ${G.lp.join(" / ")}</div>`;
+    return;
+  }
+  $("step").innerHTML = `<h2>Player ${s.player} (${esc(G.seats[s.player])}): ${esc(s.kind)}</h2>${head}
+    <ol class="opts">${s.options.map((o, k) => `<li class="${k === s.chosen ? "pick" : ""}"><span class="k">${"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"[k]}</span>${esc(o)}</li>`).join("")}</ol>`;
+}
+
+function stop() { clearInterval(timer); timer = null; $("play").textContent = "Play"; }
+$("prev").onclick = () => { stop(); if (idx > 0) show(idx - 1); };
+$("next").onclick = () => { stop(); if (idx < G.steps.length - 1) show(idx + 1); };
+$("slider").oninput = (e) => { stop(); show(+e.target.value); };
+$("play").onclick = () => {
+  if (timer) return stop();
+  $("play").textContent = "Pause";
+  timer = setInterval(() => { if (idx >= G.steps.length - 1) return stop(); show(idx + 1); }, 400);
+};
+$("back").onclick = () => { stop(); $("game").style.display = "none"; $("list").style.display = "block"; history.replaceState(null, "", location.pathname); loadList(); };
+document.addEventListener("keydown", (e) => {
+  if (!G || $("game").style.display === "none") return;
+  if (e.key === "ArrowRight") $("next").click();
+  if (e.key === "ArrowLeft") $("prev").click();
+});
+// ---- live: the newest move of games being played now (refreshed every second)
+let liveTimer = null, liveKey = null;
+function liveKeyOf(v) { return v.job + ":" + v.game; }
+async function liveTick() {
+  let games = [];
+  try { games = await (await fetch("api/live")).json(); } catch (e) {}
+  games.sort((a, b) => (a.end ? 1 : 0) - (b.end ? 1 : 0) || b.job - a.job || a.game - b.game);
+  if (!games.find((v) => liveKeyOf(v) === liveKey)) liveKey = games.length ? liveKeyOf(games[0]) : null;
+  $("liveTabs").innerHTML = games.map((v) => `<button data-k="${liveKeyOf(v)}" style="${liveKeyOf(v) === liveKey ? "border-color:var(--accent)" : ""}">${esc(v.name)} #${v.game}${v.end ? " (over)" : ""}</button>`).join(" ");
+  for (const b of $("liveTabs").querySelectorAll("button")) b.onclick = () => { liveKey = b.dataset.k; liveTick(); };
+  const v = games.find((x) => liveKeyOf(x) === liveKey);
+  if (!v) { $("liveBoard").innerHTML = ""; $("liveStep").innerHTML = "<h2>No game streaming right now</h2><div class='meta'>Games stream while the GPU worker is playing (paused while a game runs on the GPU workstation).</div>"; $("liveInfo").textContent = ""; return; }
+  G = {names: v.names, seats: v.seats, seed: v.job, reason: "", turns: v.board.turn, lp: v.board.lp};
+  $("liveBoard").innerHTML = sideHtml(v.board, 1) + sideHtml(v.board, 0);
+  $("liveInfo").textContent = `move ${v.i + 1} · turn ${v.board.turn} · ${v.board.phase}`;
+  if (v.end) {
+    const w = v.winner === -1 ? "Draw" : `Player ${v.winner} (${esc(v.seats[v.winner])}) wins`;
+    $("liveStep").innerHTML = `<h2>Game over</h2><div class="end">${w}</div>`;
+  } else {
+    $("liveStep").innerHTML = `<h2>Player ${v.player} (${esc(v.seats[v.player])}): ${esc(v.kind)}</h2><div class="meta">${esc(v.name)} · game ${v.game}</div>
+      <ol class="opts">${v.options.map((o, k) => `<li class="${k === v.chosen ? "pick" : ""}"><span class="k">${"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"[k]}</span>${esc(o)}</li>`).join("")}</ol>`;
+  }
+}
+function showLive() {
+  stop(); $("list").style.display = "none"; $("game").style.display = "none"; $("live").style.display = "block";
+  history.replaceState(null, "", "#live"); liveTick(); clearInterval(liveTimer); liveTimer = setInterval(liveTick, 1000);
+}
+$("liveBtn").onclick = showLive;
+$("liveBack").onclick = () => { clearInterval(liveTimer); $("live").style.display = "none"; $("list").style.display = "block"; history.replaceState(null, "", location.pathname); loadList(); };
+if (location.hash === "#live") showLive();
+else if (location.hash.length > 1) openGame(decodeURIComponent(location.hash.slice(1))); else loadList();
+</script>
+</body>
+</html>

@@ -77,6 +77,17 @@ extern "C" {
     pub fn OCG_DuelGetMessage(duel: OCG_Duel, length: *mut u32) -> *mut c_void;
     pub fn OCG_DuelSetResponse(duel: OCG_Duel, buffer: *const c_void, length: u32);
     pub fn OCG_LoadScript(duel: OCG_Duel, buffer: *const c_char, length: u32, name: *const c_char) -> c_int;
+    pub fn OCG_DuelQueryCount(duel: OCG_Duel, team: u8, loc: u32) -> u32;
+    pub fn OCG_DuelQueryLocation(duel: OCG_Duel, length: *mut u32, info: *const OCG_QueryInfo) -> *mut c_void;
+}
+
+#[repr(C)]
+pub struct OCG_QueryInfo {
+    pub flags: u32,
+    pub con: u8,
+    pub loc: u32,
+    pub seq: u32,
+    pub overlay_seq: u32,
 }
 
 // ocgapi_constants.h
@@ -85,6 +96,18 @@ pub const LOCATION_HAND: u32 = 0x02;
 pub const LOCATION_MZONE: u8 = 0x04;
 pub const LOCATION_SZONE: u8 = 0x08;
 pub const LOCATION_EXTRA: u32 = 0x40;
+pub const LOCATION_GRAVE: u32 = 0x10;
+pub const LOCATION_REMOVED: u32 = 0x20;
+pub const QUERY_CODE: u32 = 0x1;
+pub const QUERY_POSITION: u32 = 0x2;
+pub const QUERY_TYPE: u32 = 0x8;
+pub const QUERY_LEVEL: u32 = 0x10;
+pub const QUERY_ATTACK: u32 = 0x100;
+pub const QUERY_DEFENSE: u32 = 0x200;
+pub const QUERY_IS_PUBLIC: u32 = 0x100000;
+pub const QUERY_END: u32 = 0x80000000;
+pub const TYPE_SPELL: u32 = 0x2;
+pub const TYPE_TRAP: u32 = 0x4;
 pub const POS_FACEDOWN_DEFENSE: u32 = 0x8;
 pub const TYPE_MONSTER: u32 = 0x1;
 pub const TYPE_TOKEN: u32 = 0x4000;

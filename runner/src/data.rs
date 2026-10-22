@@ -171,9 +171,13 @@ pub extern "C" fn script_reader(payload: *mut c_void, duel: OCG_Duel, name: *con
     unsafe { OCG_LoadScript(duel, buf.as_ptr() as *const c_char, buf.len() as u32, cname.as_ptr()) }
 }
 
-pub extern "C" fn log_handler(_payload: *mut c_void, s: *const c_char, type_: c_int) {
+/// payload: this duel's own error counter (games run in parallel), or null.
+pub extern "C" fn log_handler(payload: *mut c_void, s: *const c_char, type_: c_int) {
     if type_ == OCG_LOG_TYPE_ERROR {
         SCRIPT_ERRORS.fetch_add(1, Ordering::Relaxed);
+        if !payload.is_null() {
+            unsafe { &*(payload as *const AtomicUsize) }.fetch_add(1, Ordering::Relaxed);
+        }
         let msg = unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned();
         if let Ok(mut l) = LAST_SCRIPT_ERROR.lock() {
             *l = msg;

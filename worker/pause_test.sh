@@ -1,17 +1,21 @@
 #!/bin/bash
-# Pause proof on the GPU workstation: the smoke LoRA trainer runs under supervisor.py; a fake game (a copy of `sleep`
+# Pause proof on the GPU workstation: the self-play trainer runs under supervisor.py; a fake game (a copy of `sleep`
 # named gamescope, run as `gamescope -- 120`, which the copied guard reports as a game) must make it
 # checkpoint and free the GPU within 10 s; killing the fake game must bring it back from the same step
 # within 60 s, then 10+ more steps. Run with no worker on the GPU (the baseline is taken first).
+# The trainer is the self-play PPO trainer (worker.py train), playing real games on the game host; it runs in its
+# own data dir (pause-data) so the real training run's checkpoints are never touched.
 set -u
 W=~/.local/share/ygo-worker
-L=$W/data/logs/train.jsonl
+export YGO_DATA=$W/pause-data YGO_EVAL_GAMES=${YGO_EVAL_GAMES:-20}
+L=$YGO_DATA/logs/train.jsonl
 S=$W/logs/supervisor-train.jsonl
 now() { date +%s.%N; }
 since() { awk -v a="$(now)" -v b="$1" 'BEGIN { printf "%.1f", a - b }'; }
 steps() { grep -c '"event": "step"' "$L"; }
 
-rm -rf "$W/data/ckpt"
+rm -rf "$YGO_DATA"
+mkdir -p "$YGO_DATA/logs"
 : > "$L"
 : > "$S"
 base=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
@@ -40,6 +44,7 @@ ckpt=$(grep '"event": "checkpoint"' "$L" | tail -1 | sed 's/.*"msg": "\([^"]*\)"
 echo "log: $ckpt"
 echo "gpu freed after ${freed:-NOT FREED} s; worker pid $WPID on GPU: $(nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -cx "$WPID")"
 echo "nvidia-smi memory.used=${vram} MiB, baseline ${base} MiB, delta $((vram - base)) MiB"
+(sleep 10; echo "diagnostic only: memory.used 10 s later=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) MiB; apps: $(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | tr '\n' ' ')") &
 echo "supervisor: $(grep '"event": "game_detected"\|"event": "stopped"' "$S" | tail -2 | tr '\n' ' ')"
 
 sleep 5

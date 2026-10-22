@@ -8,9 +8,14 @@ RESUME_CLEAN clean checks in a row it starts the worker again and the worker res
 The worker is a plain venv process (ROOT/venv/bin/python ROOT/app/worker.py <mode>), not a container.
 
 The guard functions below are adapted from the guard of a co-tenant GPU job on the same host.
-Only _ours() changed: "our" GPU processes are the worker and its children.
+Changes: _ours() ("our" GPU processes are the worker and its children), and a
+running co-tenant GPU job (YGO_YIELD_TO) counts as a game (its own guard would otherwise wait on our training forever).
 
-Usage: supervisor.py serve|train      Log: ~/.local/share/ygo-worker/logs/supervisor-<mode>.jsonl
+A worker that exits 0 after writing <YGO_DATA>/done-<mode> is finished: the supervisor exits too.
+Any other exit is a crash: restart after a pause, give up after 5 in a row.
+
+Usage: supervisor.py train|zeroshot|table      Log: ~/.local/share/ygo-worker/logs/supervisor-<mode>.jsonl
+Env: YGO_DATA (default ROOT/data), passed on to the worker with every other YGO_* variable.
 """
 from __future__ import annotations
 
@@ -29,6 +34,7 @@ GPU_BUSY = 50        # percent, same as the co-tenant GPU job: desktop apps run 
 YIELD_TO = os.environ.get("YGO_YIELD_TO", "")  # script path suffix of a co-tenant GPU job that yields to games
 MODE = sys.argv[1]
 NAME = f"ygo-{MODE}"
+DATA = Path(os.environ.get("YGO_DATA", str(ROOT / "data")))
 
 
 def log(event: str, **kw) -> None:
@@ -88,6 +94,8 @@ def game_procs() -> list[str]:
             hits.append(f"steam:{app}")
         elif base == "gamescope" and "--" in argv:
             hits.append("gamescope")
+        elif YIELD_TO and any(a.endswith(YIELD_TO) for a in argv[:3]):
+            hits.append("gpu-job")
     return hits
 
 
@@ -131,12 +139,13 @@ def running() -> bool:
 def start() -> None:
     global _child
     env = dict(os.environ,
-               YGO_DATA=str(ROOT / "data"),
+               YGO_DATA=str(DATA),
                HF_HOME=str(ROOT / "hf"),
                YGO_BROKER=os.environ.get("YGO_BROKER", "http://198.51.100.10:8765"))
     out = open(ROOT / "logs" / f"worker-{MODE}.out", "a")
-    _child = subprocess.Popen([str(ROOT / "venv/bin/python"), "-u", str(ROOT / "app/worker.py"), MODE],
+    _child = subprocess.Popen([str(ROOT / "venv/bin/python"), "-u", str(ROOT / "app/worker.py"), MODE] + sys.argv[2:],
                               env=env, stdout=out, stderr=subprocess.STDOUT, cwd=ROOT, start_new_session=True)
+    _child.t0 = time.time()
     log("started", pid=_child.pid)
 
 
@@ -157,10 +166,26 @@ def on_term(signum, frame) -> None:
 
 
 def main() -> None:
-    log("supervisor_up", mode=MODE, baseline_vram_mib=vram_used())
+    log("supervisor_up", mode=MODE, baseline_vram_mib=vram_used(), data=str(DATA))
     clean = RESUME_CLEAN  # start straight away when no game is on
     paused_logged = False
+    crashes = 0
     while True:
+        if _child is not None and _child.poll() is not None and not getattr(_child, "seen_exit", False):
+            _child.seen_exit = True
+            rc = _child.returncode
+            if rc == 0 and (DATA / f"done-{MODE}").exists():
+                log("worker_done", rc=rc, result=(DATA / f"done-{MODE}").read_text().strip())
+                return
+            if rc != 0 and rc != -signal.SIGTERM:
+                crashes += 1
+                log("worker_crashed", rc=rc, crashes=crashes)
+                if crashes >= int(os.environ.get("YGO_MAX_CRASHES", "5")):
+                    log("giving_up", crashes=crashes)
+                    return
+                time.sleep(20)
+        elif running():
+            crashes = 0 if time.time() - getattr(_child, "t0", time.time()) > 600 else crashes
         up = running()
         reason = game_reason(model_loaded=up)
         if reason:
@@ -181,6 +206,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if MODE == "check":  # for pipeline.sh: "idle", or why the GPU is not ours to use (no worker running)
+        print(game_reason(model_loaded=False) or "idle")
+        sys.exit(0)
     signal.signal(signal.SIGTERM, on_term)
     try:
         main()
