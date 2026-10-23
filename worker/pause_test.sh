@@ -2,7 +2,7 @@
 # Pause proof on the GPU workstation: the self-play trainer runs under supervisor.py; a fake game (a copy of `sleep`
 # named gamescope, run as `gamescope -- 120`, which the copied guard reports as a game) must make it
 # checkpoint and free the GPU within 10 s; killing the fake game must bring it back from the same step
-# within 60 s, then 10+ more steps. Run with no worker on the GPU (the baseline is taken first).
+# within 5 min (round 3; was 60 s), then 10+ more steps. Run with no worker on the GPU (the baseline is taken first).
 # The trainer is the self-play PPO trainer (worker.py train), playing real games on the game host; it runs in its
 # own data dir (pause-data) so the real training run's checkpoints are never touched.
 set -u
@@ -34,7 +34,10 @@ FAKE=$!
 echo "fake game started (pid $FAKE)"
 freed=""
 for _ in $(seq 1 60); do
-  if grep -q '"event": "checkpoint"' "$L" && ! nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -qx "$WPID"; then
+  # Freed = checkpoint logged, worker off the GPU, and memory.used back within 300 MiB of the baseline
+  # (round 3: the driver can still hold the memory for a few seconds after the process leaves the list).
+  if grep -q '"event": "checkpoint"' "$L" && ! nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -qx "$WPID" \
+     && [ $(( $(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits) - base )) -le 300 ]; then
     freed=$(since "$t0"); break
   fi
   sleep 0.5
@@ -53,7 +56,7 @@ t1=$(now)
 kill "$FAKE"
 echo "fake game killed"
 resumed=""
-for _ in $(seq 1 120); do
+for _ in $(seq 1 600); do  # up to 5 min: the supervisor waits for clean checks, then the model and labels load
   if grep -q "\"msg\": \"resumed step=$N\"" "$L"; then resumed=$(since "$t1"); break; fi
   sleep 0.5
 done
@@ -69,3 +72,11 @@ echo "steps after resume: $((last - N)) (step $N -> $last) in $(since "$t2") s"
 kill -TERM "$SUP"
 wait "$SUP" 2>/dev/null
 echo "supervisor stopped: $(tail -1 "$S")"
+
+# Verdict (round 3): exit 1 unless every criterion held, so the pipeline retries a failed run.
+fail=""
+[ -n "$freed" ] && awk -v f="$freed" 'BEGIN { exit !(f <= 10) }' || fail="$fail freed"
+[ $((vram - base)) -le 300 ] || fail="$fail vram"
+[ -n "$resumed" ] && awk -v r="$resumed" 'BEGIN { exit !(r <= 300) }' || fail="$fail resumed"
+[ $((${last:-0} - N)) -ge 10 ] || fail="$fail steps"
+if [ -z "$fail" ]; then echo "pause_test PASS"; else echo "pause_test FAIL:$fail"; exit 1; fi

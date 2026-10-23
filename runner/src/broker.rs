@@ -330,10 +330,10 @@ pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32
             for (k, pol) in g.seats.iter().enumerate() {
                 if pol == "random" {
                     agents.push(Box::new(RandomAgent));
-                } else if pol == "windbot" {
+                } else if pol == "windbot" || pol == "windbot-labels" {
                     let server = std::env::var("YGO_WINDBOT").unwrap_or("127.0.0.1:2399".into());
                     match crate::windbot::WindBot::connect(&server, "CyberDragon", k as u8, "WindBot") {
-                        Ok(w) => agents.push(Box::new(WindBotAgent(w))),
+                        Ok(w) => agents.push(Box::new(WindBotAgent(w, pol == "windbot-labels"))),
                         Err(e) => {
                             seat_error = Some(e);
                             agents.push(Box::new(RandomAgent));

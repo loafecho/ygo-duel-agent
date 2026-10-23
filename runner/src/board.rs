@@ -120,6 +120,7 @@ impl Board {
         t += &format!("My monsters: {}\n", monsters(lib, &m.mzone, true));
         t += &format!("My spells/traps: {}\n", spells(lib, &m.szone, true));
         t += &format!("My graveyard ({}): {}\n", m.grave.len(), if m.grave.is_empty() { "empty".into() } else { names(&m.grave) });
+        t += &format!("My banished ({}): {}\n", m.banished.len(), if m.banished.is_empty() { "none".into() } else { names(&m.banished) });
         t += &format!("My deck: {} cards. My extra deck: {} cards.\n", m.deck, m.extra);
         let shown: Vec<&CardView> = o.hand.iter().filter(|c| c.public).collect();
         let hand = if shown.is_empty() {
@@ -130,7 +131,13 @@ impl Board {
         t += &format!("Opponent's hand: {hand}\n");
         t += &format!("Opponent's monsters: {}\n", monsters(lib, &o.mzone, false));
         t += &format!("Opponent's spells/traps: {}\n", spells(lib, &o.szone, false));
-        t += &format!("Opponent's graveyard: {} cards.\n", o.grave.len()); // names add tokens, rarely the choice
+        t += &format!("Opponent's graveyard ({}): {}\n", o.grave.len(), if o.grave.is_empty() { "empty".into() } else { names(&o.grave) });
+        // Face-down banished cards are hidden from me: names for the face-up ones, a count for the rest.
+        let up: Vec<CardView> = o.banished.iter().filter(|c| c.pos & 0x5 != 0).cloned().collect();
+        let down = o.banished.len() - up.len();
+        t += &format!("Opponent's banished ({}): {}{}\n", o.banished.len(),
+            if up.is_empty() { if down == 0 { "none".into() } else { String::new() } } else { names(&up) },
+            if down == 0 { String::new() } else { format!("{}{down} face-down", if up.is_empty() { "" } else { ", " }) });
         t += &format!("Opponent's deck: {} cards.\n", o.deck);
         t
     }

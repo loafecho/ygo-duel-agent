@@ -43,13 +43,30 @@ pub trait Agent {
     fn windbot(&mut self) -> Option<&mut WindBot> {
         None
     }
+    /// Log this seat's own picks (board, card text, options, choice) as imitation labels.
+    fn labels(&self) -> bool {
+        false
+    }
+}
+
+/// Imitation labels from WindBot seats, one JSON line per decision with 2+ options; YGO_LABELS sets the file.
+static LABELS: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+fn write_label(v: &Value) -> Result<(), String> {
+    use std::io::Write;
+    let mut g = LABELS.lock().map_err(|_| "labels lock poisoned")?;
+    if g.is_none() {
+        let path = std::env::var("YGO_LABELS").unwrap_or("/srv/ygo/logs/windbot-labels.jsonl".into());
+        *g = Some(std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| format!("labels {path}: {e}"))?);
+    }
+    writeln!(g.as_mut().unwrap(), "{v}").map_err(|e| format!("labels write: {e}"))
 }
 
 pub struct RandomAgent;
 
 /// A seat played by WindBot. `choose` is only used when the engine rejects the bot's answer
 /// (or the turn's loop breaker fires): then it answers randomly.
-pub struct WindBotAgent(pub WindBot);
+pub struct WindBotAgent(pub WindBot, pub bool);
 
 impl Agent for WindBotAgent {
     fn choose(&mut self, d: &Decision, _: &Ctx, rng: &mut Rng) -> Result<usize, String> {
@@ -57,6 +74,9 @@ impl Agent for WindBotAgent {
     }
     fn windbot(&mut self) -> Option<&mut WindBot> {
         Some(&mut self.0)
+    }
+    fn labels(&self) -> bool {
+        self.1
     }
 }
 
@@ -268,10 +288,12 @@ pub fn play(
         }
         max_choices = max_choices.max(d.choices.len());
         let who = (d.player & 1) as usize;
-        let need_board = record || live.is_some() || (d.choices.len() > 1 && agents[who].wants_board());
+        let label = d.choices.len() > 1 && agents[who].labels();
+        let need_board = record || live.is_some() || label || (d.choices.len() > 1 && agents[who].wants_board());
         let board = if need_board { Some(Board::read(duel.0, view.turn, view.turn_player, view.phase, view.lp)?) } else { None };
         let options: Vec<String> = d.choices.iter().map(|c| c.text.clone()).collect();
-        let prompt = board.as_ref().map(|b| board::prompt(&b.describe(lib, d.player), &b.card_texts(lib, d.player, &d.codes), d.kind, &options));
+        let texts = board.as_ref().map(|b| (b.describe(lib, d.player), b.card_texts(lib, d.player, &d.codes)));
+        let prompt = texts.as_ref().map(|(bt, ct)| board::prompt(bt, ct, d.kind, &options));
         if view.turn != turn_seen {
             turn_seen = view.turn;
             turn_decisions = [0, 0];
@@ -296,7 +318,14 @@ pub fn play(
         let mut options = options;
         let i = if let Some(resp) = &wb_resp {
             match d.choices.iter().position(|c| &c.resp == resp) {
-                Some(k) => k,
+                Some(k) => {
+                    if label {
+                        let (bt, ct) = texts.as_ref().unwrap();
+                        write_label(&json!({"seed": seed, "turn": view.turn, "player": d.player & 1, "kind": d.kind,
+                            "state": bt, "cards": ct, "options": options, "choice": k}))?;
+                    }
+                    k
+                }
                 None => {
                     options.push("WindBot's own answer (not among the listed samples)".into());
                     options.len() - 1

@@ -12,7 +12,14 @@ Modes:
          Greedy evals (200 games vs WindBot, 200 vs random) run at the start and every EVAL_EVERY GPU-hours;
          training stops when vs WindBot reaches TARGET or the cap is spent ("train_stop reason=target|cap").
   zeroshot  the ZeroShot baseline: Qwen3.5-4B, no training, 200 games vs random.
-  table  the final checkpoint and up to 4 earlier ones, 100 games each vs WindBot, ZeroShot, random, the previous one.
+  table  the final checkpoint and up to 4 earlier ones, 100 games each vs WindBot, ZeroShot, random, the previous one
+         (round 3: YGO_TABLE_OPPS=windbot,ref, the reference being YGO_TABLE_REF, e.g. step-1239).
+  textcheck  round 3, no training: YGO_WARM scored on held-out WindBot-labeled decisions (YGO_LABELS_FILE) with and
+         without the card-text section; top-1 agreement with WindBot's pick decides the card-text form.
+
+Round 3 (imitation first): with YGO_LABELS_FILE set, train starts with supervised cross-entropy on the labels
+(WindBot's and the teachers' picks, the held-out games excluded), then the PPO loop above as a polish.
+YGO_CARD_TEXT=full|oneliner|none rewrites the card-text section of every prompt the model scores.
 
 SIGTERM (the supervisor's game guard) makes every mode save its state and exit so the GPU is freed;
 the next start resumes. Games on the game host just wait for answers meanwhile.
@@ -58,6 +65,12 @@ KEEP_P = float(os.environ.get("YGO_KEEP_P", "1.0"))         # share of a finishe
 PPO_EPOCHS = int(os.environ.get("YGO_PPO_EPOCHS", "2"))  # each decision is used for this many updates
 LIVE_GAMES = int(os.environ.get("YGO_LIVE_GAMES", "96"))
 MAX_TOKENS = 2048      # round 2 prompts carry card text (~600-900 tokens, more late in a game)
+CARD_TEXT = os.environ.get("YGO_CARD_TEXT", "full")  # round 3: full | oneliner | none (set by the textcheck)
+LABELS_FILE = os.environ.get("YGO_LABELS_FILE", "")
+SL_EPOCHS = float(os.environ.get("YGO_SL_EPOCHS", "1"))
+SL_LR = float(os.environ.get("YGO_SL_LR", "1e-4"))
+CAP2_H = float(os.environ.get("YGO_CAP2_H", "0"))  # round 3: at CAP_H, continue to this if the last eval beat the one before
+EVAL_OPPS = os.environ.get("YGO_EVAL_OPPS", "windbot,random").split(",")
 STOP = False
 MODE = sys.argv[1] if len(sys.argv) > 1 else ""
 
@@ -65,7 +78,7 @@ MODE = sys.argv[1] if len(sys.argv) > 1 else ""
 def recipe() -> dict:
     r = {"lr": 2e-5, "clip": 0.2, "entropy": 0.01, "shaping": 0.5, "lora_r": 16, "temp": 1.0, "random_share": 0.1,
          "windbot_share": 0.4, "pool_share": 0.25}
-    if os.environ.get("YGO_RECIPE") == "2":
+    if os.environ.get("YGO_RECIPE") in ("2", "3"):  # 3: round 3's polish shares
         r.update(json.loads(os.environ.get("YGO_RECIPE_CHANGE", "{}")))
     return r
 
@@ -117,6 +130,42 @@ def save_json(p: Path, obj) -> None:
     os.replace(tmp, p)
 
 
+# ------------------------------------------------------------------ card text
+
+_ONELINERS: dict[str, str] | None = None
+
+
+def render_cards(prompt: str, mode: str | None = None) -> str:
+    """The prompt with its "Card text:" section kept (full), cut to one hand-written line per card (oneliner),
+    or removed (none)."""
+    global _ONELINERS
+    mode = mode or CARD_TEXT
+    if mode == "full" or "Card text:\n" not in prompt:
+        return prompt
+    head, _, rest = prompt.partition("Card text:\n")
+    cards, sep, tail = rest.partition("Decision: ")
+    if mode == "none":
+        return head + sep + tail
+    if _ONELINERS is None:
+        _ONELINERS = json.loads((Path(__file__).parent / "oneliners.json").read_text())
+    lines = []
+    for line in cards.splitlines():
+        name, _, text = line.removeprefix("- ").partition(": ")
+        short = _ONELINERS.get(name) or text.split(". ")[0].rstrip(".") + "."  # unknown card: its first sentence
+        lines.append(f"- {name}: {short}")
+    return head + "Card text:\n" + "\n".join(lines) + "\n" + sep + tail
+
+
+def load_labels(held: bool | None = None, src: str | None = None) -> list[dict]:
+    out = []
+    with open(LABELS_FILE) as f:
+        for line in f:
+            r = json.loads(line)
+            if (held is None or r["held"] == held) and (src is None or r["src"] == src):
+                out.append(r)
+    return out
+
+
 # ------------------------------------------------------------------ scoring
 
 class Scorer:
@@ -151,6 +200,7 @@ class Scorer:
         return L if self.chat else " " + L
 
     def format(self, prompt: str) -> str:
+        prompt = render_cards(prompt)
         if not self.chat:
             return prompt
         body = prompt.removesuffix("Answer:") + "Reply with only the letter of the best option."
@@ -406,9 +456,9 @@ def train() -> None:
         return max(0.0, R["shaping"] * (1 - s["gpu_s"] / 3600 / (CAP_H / 2)))
 
     def do_eval() -> float | None:
-        """200 greedy games vs WindBot, then 200 vs random (each resumable). Returns the WindBot win rate."""
+        """200 greedy games vs each of EVAL_OPPS (WindBot, then random; each resumable). Returns the WindBot win rate."""
         out = {}
-        for opp in ("windbot", "random"):
+        for opp in EVAL_OPPS:
             part = s.setdefault("eval_parts", {})
             key = f"{s['step']}:{opp}"
             if key in part:
@@ -426,15 +476,19 @@ def train() -> None:
             (DATA / "eval-state.json").unlink(missing_ok=True)
             part[key] = out[opp] = res
             save_json(CKPT / "state.json", s)
-        w, r = out["windbot"], out["random"]
+        w, r = out["windbot"], out.get("random")
+        parts = list(out.values())
         gpu_h = round(s["gpu_s"] / 3600, 2)
-        s["evals"].append({"step": s["step"], "gpu_h": gpu_h, "vs_windbot": w["win_rate"], "vs_random": r["win_rate"],
-                           "games": w["games"], "errors": w["errors"] + r["errors"], "replays": w["replays"] + r["replays"]})
+        s["evals"].append({"step": s["step"], "gpu_h": gpu_h, "vs_windbot": w["win_rate"],
+                           "vs_random": r["win_rate"] if r else None, "games": w["games"],
+                           "errors": sum(x["errors"] for x in parts), "replays": sum((x["replays"] for x in parts), [])})
         s["eval_parts"] = {}
-        log("eval", step=s["step"], gpu_h=gpu_h, vs_windbot=w["win_rate"], vs_random=r["win_rate"], games=w["games"],
-            games_random=r["games"], errors=w["errors"] + r["errors"], wins_windbot=w["wins"], draws_windbot=w["draws"],
-            loop_breaks=w["loop_breaks"] + r["loop_breaks"], errors_detail=(w["errors_detail"] + r["errors_detail"])[:3],
-            msg=f"eval step={s['step']} gpu_h={gpu_h} vs_windbot={w['win_rate']:.3f} vs_random={r['win_rate']:.3f} games={w['games']}")
+        vs_r = f" vs_random={r['win_rate']:.3f}" if r else ""
+        log("eval", step=s["step"], gpu_h=gpu_h, vs_windbot=w["win_rate"], vs_random=r["win_rate"] if r else None,
+            games=w["games"], games_random=r["games"] if r else 0, errors=sum(x["errors"] for x in parts),
+            wins_windbot=w["wins"], draws_windbot=w["draws"], loop_breaks=sum(x["loop_breaks"] for x in parts),
+            errors_detail=sum((x["errors_detail"] for x in parts), [])[:3],
+            msg=f"eval step={s['step']} gpu_h={gpu_h} vs_windbot={w['win_rate']:.3f}{vs_r} games={w['games']}")
         save_json(CKPT / "state.json", s)
         return w["win_rate"]
 
@@ -528,8 +582,11 @@ def train() -> None:
         return {k: round(v, 4) for k, v in tot.items()}
 
     try:
-        train_loop(s, sc, model, opt, buffer, traj, pool, save_ckpt, add_pool, tick, shaping_coef, do_eval,
-                   submit_games, finish_game, update)
+        if LABELS_FILE and not s.get("sl_done"):
+            imitate(s, sc, model, opt, params, save_ckpt, add_pool, tick)
+        if s.get("sl_done") or not LABELS_FILE:
+            train_loop(s, sc, model, opt, buffer, traj, pool, save_ckpt, add_pool, tick, shaping_coef, do_eval,
+                       submit_games, finish_game, update)
     except Stopped:
         pass
     if not (DATA / "done-train").exists():
@@ -597,7 +654,7 @@ def train_loop(s, sc, model, opt, buffer, traj, pool, save_ckpt, add_pool, tick,
                 del traj[k]  # its game was lost (server restart) or ran during an eval
             log("progress", step=s["step"], gpu_h=round(s["gpu_s"] / 3600, 3), games=s["games"], errors=s["errors"],
                 decisions=s["decisions"], buffer=len(buffer))
-        done = s["gpu_s"] >= CAP_H * 3600
+        done = s["gpu_s"] >= s.get("cap_h", CAP_H) * 3600
         if (s["gpu_s"] - last_eval_gpu_s >= EVAL_EVERY_H * 3600 or done) and EVAL_GAMES > 0 and not STOP:
             server_call("/cancel", {})
             wr = do_eval()
@@ -606,6 +663,14 @@ def train_loop(s, sc, model, opt, buffer, traj, pool, save_ckpt, add_pool, tick,
             last_eval_gpu_s = s["gpu_s"]
             add_pool()
             save_ckpt("eval")
+            ev = s["evals"]
+            if done and wr < TARGET and CAP2_H > s.get("cap_h", CAP_H) and len(ev) >= 2 and ev[-1]["vs_windbot"] > ev[-2]["vs_windbot"]:
+                s["cap_h"] = CAP2_H  # still climbing at the cap: one extension, then stop whatever it reached
+                log("cap_extend", step=s["step"], gpu_h=round(s["gpu_s"] / 3600, 2), cap_h=CAP2_H,
+                    last=ev[-1]["vs_windbot"], before=ev[-2]["vs_windbot"],
+                    msg=f"cap_extend to {CAP2_H} GPU-hours: {ev[-1]['vs_windbot']:.3f} > {ev[-2]['vs_windbot']:.3f}")
+                save_json(CKPT / "state.json", s)
+                continue
             if wr >= TARGET or done:
                 reason = "target" if wr >= TARGET else "cap"
                 server_call("/cancel", {})
@@ -613,6 +678,104 @@ def train_loop(s, sc, model, opt, buffer, traj, pool, save_ckpt, add_pool, tick,
                     msg=f"train_stop reason={reason}")
                 (DATA / "done-train").write_text(reason)
                 return
+
+
+# ------------------------------------------------------------------ round 3: imitation and the card-text check
+
+def imitate(s, sc, model, opt, params, save_ckpt, add_pool, tick) -> None:
+    """Supervised cross-entropy on the labels' picks (held-out games excluded), SL_EPOCHS passes in a fixed
+    shuffled order. Resumable: the position is in the state. Ends with a pool snapshot and held-out accuracy."""
+    train_set = load_labels(held=False)
+    order = list(range(len(train_set)))
+    random.Random(3).shuffle(order)
+    total = int(len(order) * SL_EPOCHS)
+    for g in opt.param_groups:
+        g["lr"] = SL_LR
+    pos = s.get("sl_pos", 0)
+    log("sl_start", labels=len(train_set), steps=total // BATCH, pos=pos, lr=SL_LR, card_text=CARD_TEXT)
+    t_save = time.time()
+    while pos + BATCH <= total:
+        if STOP:
+            raise Stopped()
+        batch = [train_set[order[k % len(order)]] for k in range(pos, pos + BATCH)]
+        model.train()
+        opt.zero_grad(set_to_none=True)
+        loss_t = acc = 0.0
+        micro = s.get("micro", MICRO)
+        try:
+            for i in range(0, BATCH, micro):
+                mb = batch[i:i + micro]
+                lg = sc.logits([d["prompt"] for d in mb], [d["n"] for d in mb], grad=True)
+                loss = sum(-torch.log_softmax(l, -1)[d["choice"]] for d, l in zip(mb, lg)) / BATCH
+                loss.backward()
+                loss_t += loss.item()
+                acc += sum(int(torch.argmax(l)) == d["choice"] for d, l in zip(mb, lg)) / BATCH
+        except torch.OutOfMemoryError:
+            opt.zero_grad(set_to_none=True)
+            model.eval()
+            torch.cuda.empty_cache()
+            s["micro"] = max(1, micro // 2)
+            log("oom_skip", step=s["step"], micro=s["micro"])
+            continue  # same batch again with smaller micro-batches
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        model.eval()
+        pos += BATCH
+        s["sl_pos"] = pos
+        s["step"] += 1
+        tick()
+        log("step", phase="sl", step=s["step"], gpu_h=round(s["gpu_s"] / 3600, 3), loss=round(loss_t, 4),
+            acc=round(acc, 3), pos=pos, of=total)
+        if time.time() - t_save > SAVE_EVERY_S:
+            save_ckpt("periodic")
+            t_save = time.time()
+    held = load_labels(held=True, src="windbot")
+    random.Random(0).shuffle(held)
+    held = held[:2500]
+    hits = sum(int(torch.argmax(l)) == d["choice"] for d, l in zip(held, sc.logits([d["prompt"] for d in held], [d["n"] for d in held])))
+    for g in opt.param_groups:
+        g["lr"] = s["recipe"]["lr"]
+    opt.state.clear()  # PPO starts with fresh Adam moments at its own learning rate
+    s["sl_done"] = True
+    s["sl_heldout_acc"] = round(hits / max(1, len(held)), 4)
+    tick()
+    add_pool()
+    save_ckpt("sl_done")
+    log("sl_done", step=s["step"], gpu_h=round(s["gpu_s"] / 3600, 3), heldout_acc=s["sl_heldout_acc"], heldout=len(held),
+        msg=f"sl_done step={s['step']} heldout_acc={s['sl_heldout_acc']:.3f} on {len(held)} held-out WindBot decisions")
+
+
+def textcheck() -> None:
+    """No training: YGO_WARM's top-1 agreement with WindBot on held-out decisions, with and without card text."""
+    n = int(os.environ.get("YGO_CHECK_N", "2500"))
+    held = load_labels(held=True, src="windbot")
+    random.Random(0).shuffle(held)
+    held = held[:n]
+    sc = Scorer(MODEL, chat=False, lora_r=16)
+    if WARM:
+        blob = torch.load(WARM, map_location=DEVICE)
+        with torch.no_grad():
+            for k, p in lora_params(sc.model).items():
+                p.copy_(blob[k])
+    acc = {}
+    for mode in ("full", "none"):
+        hits = 0
+        for i in range(0, len(held), 256):
+            if STOP:
+                return
+            part = held[i:i + 256]
+            lg = sc.logits([render_cards(d["prompt"], mode) for d in part], [d["n"] for d in part])
+            hits += sum(int(torch.argmax(l)) == d["choice"] for d, l in zip(part, lg))
+        acc[mode] = hits / len(held)
+        log("textcheck_part", mode=mode, decisions=len(held), acc=round(acc[mode], 4))
+    # chance level for reference: the mean of 1/n
+    chance = sum(1 / d["n"] for d in held) / len(held)
+    pick = "full" if acc["full"] >= acc["none"] + 0.02 else "oneliner"
+    save_json(DATA / "textcheck.json", {"warm": WARM, "decisions": len(held), "acc_text": acc["full"],
+                                        "acc_notext": acc["none"], "chance": chance, "card_text": pick})
+    log("textcheck", decisions=len(held), chance=round(chance, 4),
+        msg=f"check decisions={len(held)} acc_text={acc['full']:.4f} acc_notext={acc['none']:.4f} card_text={pick}")
+    (DATA / "done-textcheck").write_text(pick)
 
 
 # ------------------------------------------------------------------ zeroshot
@@ -625,14 +788,28 @@ def zeroshot_players():
 
 def zeroshot() -> None:
     games = int(os.environ.get("YGO_ZEROSHOT_GAMES", "200"))
+    opp = os.environ.get("YGO_ZEROSHOT_OPP", "random")  # "windbot": the fallback-teacher test
     _, play = zeroshot_players()
-    res = run_match(f"zeroshot-{games}", seats_vs("zeroshot", "random", games), {"zeroshot": play}, DATA / "zeroshot-state.json", seed=7)
+    tag = "" if opp == "random" else f"-vs-{opp}"
+    picks_log = os.environ.get("YGO_PICKS_LOG", "")  # round 3: ZeroShot's picks as teacher labels (teacher-pick format)
+    if picks_log:
+        inner = play
+
+        def play(rs):
+            out = inner(rs)
+            with open(picks_log, "a") as f:
+                for r, (a, _) in zip(rs, out):
+                    f.write(json.dumps({"job": r["job"], "idx": r["idx"], "seat": r["seat"], "turn": r.get("turn"),
+                                        "prompt": r["prompt"], "n": r["n"], "choice": a}) + "\n")
+            return out
+    res = run_match(f"zeroshot-{games}{tag}", seats_vs("zeroshot", opp, games), {"zeroshot": play}, DATA / f"zeroshot{tag}-state.json",
+                    seed=7)
     if res is None:
         return
-    save_json(DATA / "zeroshot.json", {"model": ZEROSHOT_MODEL, **res})
-    log("zeroshot_done", model=ZEROSHOT_MODEL, games=res["games"], errors=res["errors"], win_rate=res["win_rate"],
+    save_json(DATA / f"zeroshot{tag}.json", {"model": ZEROSHOT_MODEL, "opp": opp, **res})
+    log("zeroshot_done", model=ZEROSHOT_MODEL, opp=opp, games=res["games"], errors=res["errors"], win_rate=res["win_rate"],
         loop_breaks=res["loop_breaks"],
-        msg=f"zeroshot_model={ZEROSHOT_MODEL} zeroshot_games={res['games']} errors={res['errors']} win_rate={res['win_rate']:.3f}")
+        msg=f"zeroshot_model={ZEROSHOT_MODEL} opp={opp} zeroshot_games={res['games']} errors={res['errors']} win_rate={res['win_rate']:.3f}")
     (DATA / "done-zeroshot").write_text("ok")
 
 
@@ -660,11 +837,15 @@ def table() -> None:
     zero = {n: torch.zeros_like(t) for n, t in next(iter(states.values())).items() if "lora_B" in n}
     base_state = {n: (zero[n] if n in zero else t) for n, t in next(iter(states.values())).items()}  # B=0: no adapter
     states["base"] = base_state
-    zeroshot_sc, zeroshot_play = zeroshot_players()
+    opps = os.environ.get("YGO_TABLE_OPPS", "windbot,zeroshot,random,prev").split(",")
+    ref = os.environ.get("YGO_TABLE_REF", "")  # round 3: step-1239, the round-1 model both rounds warm-started from
+    if "ref" in opps:
+        states["ref"] = torch.load(ref, map_location=DEVICE)
+    zeroshot_play = zeroshot_players()[1] if "zeroshot" in opps else None
     out = DATA / "table.json"
     rows = json.loads(out.read_text()) if out.exists() else {}
     for p in picks:
-        for opp in ("windbot", "zeroshot", "random", "prev"):
+        for opp in opps:
             key = f"{p['name']}:{opp}"
             if key in rows:
                 continue
@@ -676,22 +857,26 @@ def table() -> None:
             elif opp == "prev":
                 opp_tag = f"ck:{opp_tag}"
                 players[opp_tag] = (lambda rs, n=prev[p["name"]]: choose(sc, rs, greedy=True, state=states[n]))
+            elif opp == "ref":
+                opp_tag = "ck:ref"
+                players[opp_tag] = (lambda rs: choose(sc, rs, greedy=True, state=states["ref"]))
             res = run_match(f"table-{p['name']}-vs-{opp}", seats_vs(me, opp_tag, 100), players,
                             DATA / "table-state.json", seed=500 + p["step"], replay_first=1)
             if res is None:
                 return
             (DATA / "table-state.json").unlink(missing_ok=True)
             rows[key] = {"ckpt": p["name"], "step": p["step"], "gpu_h": p["gpu_h"], "opp": opp,
-                         "opp_name": prev[p["name"]] if opp == "prev" else opp, **res}
+                         "opp_name": prev[p["name"]] if opp == "prev" else Path(ref).stem if opp == "ref" else opp, **res}
             save_json(out, rows)
             log("table_row", **{k: rows[key][k] for k in ("ckpt", "opp", "opp_name", "games", "win_rate", "errors")})
-    lines = [f"{'checkpoint':<12} {'step':>6} {'gpu_h':>6}  {'vs_windbot':>10}  {'vs_zeroshot':>8}  {'vs_random':>9}  {'vs_previous':>18}  errors"]
+    head = {"windbot": "vs_windbot", "zeroshot": "vs_zeroshot", "random": "vs_random", "prev": "vs_previous",
+            "ref": f"vs_{Path(ref).stem}" if ref else "vs_ref"}
+    lines = [f"{'checkpoint':<12} {'step':>6} {'gpu_h':>6}  " + "  ".join(f"{head[o]:>12}" for o in opps) + "  errors"]
     for p in picks:
-        r = {o: rows[f"{p['name']}:{o}"] for o in ("windbot", "zeroshot", "random", "prev")}
+        r = {o: rows[f"{p['name']}:{o}"] for o in opps}
         err = sum(x["errors"] for x in r.values())
-        lines.append(f"{p['name']:<12} {p['step']:>6} {p['gpu_h']:>6}  {r['windbot']['win_rate']:>10.2f}  "
-                     f"{r['zeroshot']['win_rate']:>8.2f}  {r['random']['win_rate']:>9.2f}  "
-                     f"{r['prev']['win_rate']:>5.2f} ({r['prev']['opp_name']:>10})  {err}")
+        cells = [f"{r[o]['win_rate']:>5.2f} ({r[o]['opp_name']})" if o == "prev" else f"{r[o]['win_rate']:>12.2f}" for o in opps]
+        lines.append(f"{p['name']:<12} {p['step']:>6} {p['gpu_h']:>6}  " + "  ".join(cells) + f"  {err}")
     total_games = sum(x["games"] for x in rows.values())
     lines.append(f"table_games={total_games} errors={sum(x['errors'] for x in rows.values())} "
                  f"(each row: 100 games per opponent, greedy, half as first player; draws count as non-wins)")
@@ -706,4 +891,4 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, on_term)
     if DEVICE == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
-    {"train": train, "zeroshot": zeroshot, "table": table}[MODE]()
+    {"train": train, "zeroshot": zeroshot, "table": table, "textcheck": textcheck}[MODE]()
