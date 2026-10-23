@@ -13,7 +13,7 @@
 //! for a game); a duel waiting on the worker just waits, it never times out.
 use crate::data::Library;
 use crate::decide::Decision;
-use crate::duel::{self, Agent, Ctx, Outcome, RandomAgent};
+use crate::duel::{self, Agent, Ctx, Outcome, RandomAgent, WindBotAgent};
 use crate::rng::Rng;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -326,9 +326,19 @@ pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32
             let g = b.take_game();
             let started = Instant::now();
             let mut agents: Vec<Box<dyn Agent + '_>> = Vec::new();
+            let mut seat_error: Option<String> = None;
             for (k, pol) in g.seats.iter().enumerate() {
                 if pol == "random" {
                     agents.push(Box::new(RandomAgent));
+                } else if pol == "windbot" {
+                    let server = std::env::var("YGO_WINDBOT").unwrap_or("127.0.0.1:2399".into());
+                    match crate::windbot::WindBot::connect(&server, "CyberDragon", k as u8, "WindBot") {
+                        Ok(w) => agents.push(Box::new(WindBotAgent(w))),
+                        Err(e) => {
+                            seat_error = Some(e);
+                            agents.push(Box::new(RandomAgent));
+                        }
+                    }
                 } else {
                     agents.push(Box::new(RemoteAgent { broker: &b, job: g.job, idx: g.idx, seat: k as u8, policy: pol.clone(), requests: 0 }));
                 }
@@ -342,8 +352,9 @@ pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32
                 b.publish(g.job, g.idx, v);
             };
             let live: Option<&dyn Fn(Value)> = if g.live { Some(&publish) } else { None };
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                duel::play(&lib, &deck, g.seed, &mut [a0[0].as_mut(), rest[0].as_mut()], g.replay, live)
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &seat_error {
+                Some(e) => Err(e.clone()),
+                None => duel::play(&lib, &deck, g.seed, &mut [a0[0].as_mut(), rest[0].as_mut()], g.replay, live),
             }));
             let res = match res {
                 Ok(r) => r,
@@ -369,6 +380,7 @@ pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32
                     out["script_errors"] = json!(r.script_errors);
                     out["max_choices"] = json!(r.max_choices);
                     out["loop_breaks"] = json!(r.loop_breaks);
+                    out["loop_turns"] = json!(r.loop_turns);
                     if g.replay {
                         let file = format!("{}-j{}-g{}.json", g.name, g.job, g.idx);
                         let rep = json!({"name": g.name, "job": g.job, "game": g.idx, "seed": g.seed, "seats": g.seats,
@@ -380,6 +392,10 @@ pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32
                     }
                 }
                 Err(e) => out["error"] = json!(e),
+            }
+            let wb: Vec<Value> = agents.iter_mut().filter_map(|a| a.windbot().map(|w| json!({"seat": w.seat, "decisions": w.decisions, "fallbacks": w.fallbacks}))).collect();
+            if !wb.is_empty() {
+                out["windbot"] = json!(wb);
             }
             drop(agents);
             b.finish_game(g.job, out, error);

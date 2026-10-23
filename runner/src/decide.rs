@@ -37,6 +37,8 @@ pub struct Decision {
     /// Select/unselect (26) only: the card each "unselect" choice takes back, so the caller can stop it
     /// from being picked again in the same selection (a fixed policy would otherwise toggle it forever).
     pub unselects: Vec<Option<CardKey>>,
+    /// Cards the options name, first-mentioned order (not the declare-a-card list: those are random picks).
+    pub codes: Vec<u32>,
 }
 
 /// controller, location, sequence, code
@@ -107,7 +109,22 @@ fn loc_name(loc: u8) -> &'static str {
     }
 }
 
+thread_local! {
+    /// Card codes the options of the decision being parsed mention (their effect text goes in the prompt).
+    static MENTIONED: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn note(code: u32) {
+    MENTIONED.with(|m| {
+        let mut m = m.borrow_mut();
+        if !m.contains(&code) {
+            m.push(code);
+        }
+    });
+}
+
 fn card_text(lib: &Library, code: u32, me: u8, con: u8, loc: u8) -> String {
+    note(code);
     let whose = if con == me { "my" } else { "opponent's" };
     format!("{} ({whose} {})", lib.name(code), loc_name(loc))
 }
@@ -121,6 +138,7 @@ fn push_unique(out: &mut Vec<Choice>, c: Choice) {
 /// `unselected`: cards taken back earlier in the current select/unselect sequence (not offered again).
 pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -> Result<Decision, String> {
     let t = msg[0];
+    MENTIONED.with(|m| m.borrow_mut().clear());
     let mut r = Reader::new(&msg[1..]);
     let player = r.u8()?;
     let mut ch: Vec<Choice> = Vec::new();
@@ -298,6 +316,7 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -
             let pos = r.u8()?;
             for (bit, name) in [(1u8, "face-up attack"), (2, "face-down attack"), (4, "face-up defense"), (8, "face-down defense")] {
                 if pos & bit != 0 {
+                    note(code);
                     ch.push(Choice { text: format!("{} in {name}", lib.name(code)), resp: i32r(bit as i32) });
                 }
             }
@@ -521,7 +540,8 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -
         _ => return Err(format!("unhandled decision message {t}")),
     }
     unselects.resize(ch.len(), None);
-    Ok(Decision { msg: t, player, kind, choices: ch, unselects })
+    let codes = MENTIONED.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    Ok(Decision { msg: t, player, kind, choices: ch, unselects, codes })
 }
 
 /// select_sum_check1 from playerop.cpp: every card uses one of its two values and they add up to acc exactly.

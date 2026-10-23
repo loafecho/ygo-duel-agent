@@ -58,12 +58,13 @@ for _ in $(seq 1 120); do
   sleep 0.5
 done
 echo "log: $(grep '"event": "resumed"' "$L" | tail -1 | sed 's/.*"msg": "\([^"]*\)".*/\1/') after ${resumed:-NOT RESUMED} s"
-for _ in $(seq 1 120); do
+t2=$(now)
+for _ in $(seq 1 600); do  # up to 5 min to watch 10 steps (round-2 steps take ~6 s: card-text prompts)
   last=$(grep '"event": "step"' "$L" | tail -1 | sed 's/.*"step": \([0-9]*\).*/\1/')
   [ "${last:-0}" -ge $((N + 10)) ] && break
   sleep 0.5
 done
-echo "steps after resume: $((last - N)) (step $N -> $last)"
+echo "steps after resume: $((last - N)) (step $N -> $last) in $(since "$t2") s"
 
 kill -TERM "$SUP"
 wait "$SUP" 2>/dev/null

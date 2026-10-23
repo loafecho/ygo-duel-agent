@@ -5,12 +5,14 @@ Every decision arrives as a prompt (board, decision, lettered options, "Answer:"
 A model scores it with its first-token logits over the option letters: one forward pass per decision.
 
 Modes:
-  train  self-play PPO on Qwen2.5-0.5B + LoRA. Opponents: itself, a pool of its last 5 checkpoints, and 20% random.
-         Reward +1 win, -1 loss or draw, plus LP-difference shaping that fades to 0 by half the GPU-hour cap.
-         A 200-game greedy eval vs random runs at the start and every EVAL_EVERY GPU-hours; training stops
-         when one reaches TARGET or the cap is spent ("train_stop reason=target|cap").
+  train  self-play PPO on Qwen2.5-0.5B + LoRA (round 2: warm start from YGO_WARM, a pool .pt). Opponents: WindBot,
+         itself, a pool of its last 5 checkpoints, and random (shares in recipe()).
+         Reward +1 win, -1 loss or draw, plus LP-difference shaping that fades to 0 by half the GPU-hour cap, minus
+         LOOP_PENALTY on a seat's decisions in a turn where the runner's loop breaker took over from it.
+         Greedy evals (200 games vs WindBot, 200 vs random) run at the start and every EVAL_EVERY GPU-hours;
+         training stops when vs WindBot reaches TARGET or the cap is spent ("train_stop reason=target|cap").
   zeroshot  the ZeroShot baseline: Qwen3.5-4B, no training, 200 games vs random.
-  table  Phase 3: the final checkpoint and up to 4 earlier ones, 100 games each vs random, ZeroShot, the previous one.
+  table  the final checkpoint and up to 4 earlier ones, 100 games each vs WindBot, ZeroShot, random, the previous one.
 
 SIGTERM (the supervisor's game guard) makes every mode save its state and exit so the GPU is freed;
 the next start resumes. Games on the game host just wait for answers meanwhile.
@@ -41,10 +43,12 @@ LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 # training recipe (YGO_RECIPE=2 is the one allowed change for a second run; see recipe())
 CAP_H = float(os.environ.get("YGO_CAP_H", "24"))
-TARGET = 0.60
-EVAL_EVERY_H = float(os.environ.get("YGO_EVAL_EVERY_H", "2.0"))
+TARGET = 0.50          # vs WindBot
+LOOP_PENALTY = float(os.environ.get("YGO_LOOP_PENALTY", "0.1"))
+WARM = os.environ.get("YGO_WARM", "")
+EVAL_EVERY_H = float(os.environ.get("YGO_EVAL_EVERY_H", "4.0"))  # round 2: a WindBot+random eval costs ~1 GPU-hour
 EVAL_GAMES = int(os.environ.get("YGO_EVAL_GAMES", "200"))
-CKPT_EVERY_S = 1800    # a pool snapshot (opponent + Phase 3 table candidate)
+CKPT_EVERY_S = int(os.environ.get("YGO_POOL_EVERY_S", "1800"))  # a pool snapshot (opponent + table candidate); 35 MB each
 SAVE_EVERY_S = 600     # the resumable checkpoint, so a crash costs at most this much
 POOL = 5
 BATCH = int(os.environ.get("YGO_BATCH", "32"))
@@ -53,14 +57,14 @@ BUFFER_CAP = 4096
 KEEP_P = float(os.environ.get("YGO_KEEP_P", "1.0"))         # share of a finished game's decisions kept (was 0.35 in run 1: the buffer starved, so keep all)
 PPO_EPOCHS = int(os.environ.get("YGO_PPO_EPOCHS", "2"))  # each decision is used for this many updates
 LIVE_GAMES = int(os.environ.get("YGO_LIVE_GAMES", "96"))
-MAX_TOKENS = 1536
+MAX_TOKENS = 2048      # round 2 prompts carry card text (~600-900 tokens, more late in a game)
 STOP = False
 MODE = sys.argv[1] if len(sys.argv) > 1 else ""
 
 
 def recipe() -> dict:
-    r = {"lr": 2e-5, "clip": 0.2, "entropy": 0.01, "shaping": 0.5, "lora_r": 16, "temp": 1.0, "random_share": 0.2,
-         "pool_share": 0.4}
+    r = {"lr": 2e-5, "clip": 0.2, "entropy": 0.01, "shaping": 0.5, "lora_r": 16, "temp": 1.0, "random_share": 0.1,
+         "windbot_share": 0.4, "pool_share": 0.25}
     if os.environ.get("YGO_RECIPE") == "2":
         r.update(json.loads(os.environ.get("YGO_RECIPE_CHANGE", "{}")))
     return r
@@ -360,7 +364,13 @@ def train() -> None:
         log("resumed", step=s["step"], msg=f"resumed step={s['step']}", gpu_h=round(s["gpu_s"] / 3600, 3),
             buffer=len(buffer), live=len(traj))
     else:
-        log("fresh", step=0, model=MODEL, recipe=R)
+        if WARM:
+            blob = torch.load(WARM, map_location=DEVICE)
+            with torch.no_grad():
+                for n, p in lora_params(model).items():
+                    p.copy_(blob[n])
+            s["warm"] = WARM
+        log("fresh", step=0, model=MODEL, recipe=R, warm=WARM)
     pool = {p["name"]: torch.load(CKPT / "pool" / f"{p['name']}.pt", map_location=DEVICE) for p in s["pool"]}
 
     def save_ckpt(reason: str) -> None:
@@ -396,24 +406,37 @@ def train() -> None:
         return max(0.0, R["shaping"] * (1 - s["gpu_s"] / 3600 / (CAP_H / 2)))
 
     def do_eval() -> float | None:
-        try:
-            res = run_match(f"eval-step{s['step']}", seats_vs("eval", "random", EVAL_GAMES),
-                            {"eval": lambda rs: choose(sc, rs, greedy=True)}, DATA / "eval-state.json",
-                        seed=1000 + s["step"], on_tick=tick)
-        except Stopped:
-            return None
-        traj.clear()  # games that ran during the eval got stand-in answers; their trajectories are incomplete
-        if res is None:
-            return None
-        (DATA / "eval-state.json").unlink(missing_ok=True)
+        """200 greedy games vs WindBot, then 200 vs random (each resumable). Returns the WindBot win rate."""
+        out = {}
+        for opp in ("windbot", "random"):
+            part = s.setdefault("eval_parts", {})
+            key = f"{s['step']}:{opp}"
+            if key in part:
+                out[opp] = part[key]
+                continue
+            try:
+                res = run_match(f"eval-step{s['step']}-{opp}", seats_vs("eval", opp, EVAL_GAMES),
+                                {"eval": lambda rs: choose(sc, rs, greedy=True)}, DATA / "eval-state.json",
+                                seed=1000 + s["step"], on_tick=tick)
+            except Stopped:
+                return None
+            traj.clear()  # games that ran during the eval got stand-in answers; their trajectories are incomplete
+            if res is None:
+                return None
+            (DATA / "eval-state.json").unlink(missing_ok=True)
+            part[key] = out[opp] = res
+            save_json(CKPT / "state.json", s)
+        w, r = out["windbot"], out["random"]
         gpu_h = round(s["gpu_s"] / 3600, 2)
-        s["evals"].append({"step": s["step"], "gpu_h": gpu_h, "vs_random": res["win_rate"], "games": res["games"],
-                           "errors": res["errors"], "replays": res["replays"]})
-        log("eval", step=s["step"], gpu_h=gpu_h, vs_random=res["win_rate"], games=res["games"], errors=res["errors"],
-            wins=res["wins"], draws=res["draws"], loop_breaks=res["loop_breaks"],
-            msg=f"eval step={s['step']} gpu_h={gpu_h} vs_random={res['win_rate']:.3f} games={res['games']}")
+        s["evals"].append({"step": s["step"], "gpu_h": gpu_h, "vs_windbot": w["win_rate"], "vs_random": r["win_rate"],
+                           "games": w["games"], "errors": w["errors"] + r["errors"], "replays": w["replays"] + r["replays"]})
+        s["eval_parts"] = {}
+        log("eval", step=s["step"], gpu_h=gpu_h, vs_windbot=w["win_rate"], vs_random=r["win_rate"], games=w["games"],
+            games_random=r["games"], errors=w["errors"] + r["errors"], wins_windbot=w["wins"], draws_windbot=w["draws"],
+            loop_breaks=w["loop_breaks"] + r["loop_breaks"], errors_detail=(w["errors_detail"] + r["errors_detail"])[:3],
+            msg=f"eval step={s['step']} gpu_h={gpu_h} vs_windbot={w['win_rate']:.3f} vs_random={r['win_rate']:.3f} games={w['games']}")
         save_json(CKPT / "state.json", s)
-        return res["win_rate"]
+        return w["win_rate"]
 
     def submit_games(n: int) -> None:
         games = []
@@ -421,7 +444,9 @@ def train() -> None:
             u = random.random()
             if u < R["random_share"]:
                 opp = "random"
-            elif u < R["random_share"] + R["pool_share"] and pool:
+            elif u < R["random_share"] + R["windbot_share"]:
+                opp = "windbot"
+            elif u < R["random_share"] + R["windbot_share"] + R["pool_share"] and pool:
                 opp = "pool:" + random.choice(list(pool))
             else:
                 opp = "learner"
@@ -448,9 +473,10 @@ def train() -> None:
             won = res["winner"] == seat
             R_ = 1.0 if won else -1.0  # a draw counts as a loss
             phi_end = (res["lp"][seat] - res["lp"][1 - seat]) / 8000
+            looped = {t for st_, t in res.get("loop_turns", []) if st_ == seat}
             for d in ds:
                 if random.random() < KEEP_P:
-                    d["ret"] = R_ + c * (phi_end - d["phi"])
+                    d["ret"] = R_ + c * (phi_end - d["phi"]) - (LOOP_PENALTY if d.get("turn") in looped else 0.0)
                     buffer.append(d)
         del buffer[: max(0, len(buffer) - BUFFER_CAP)]
 
@@ -461,7 +487,8 @@ def train() -> None:
             opt.zero_grad(set_to_none=True)
             model.eval()
             torch.cuda.empty_cache()
-            log("oom_skip", step=s["step"])  # this batch is dropped; the next one tries again
+            s["micro"] = max(1, s.get("micro", MICRO) // 2)  # long card-text prompts: smaller micro-batches from now on
+            log("oom_skip", step=s["step"], micro=s["micro"])  # this batch is dropped; the next one tries again
             return None
 
     def update_once() -> dict:
@@ -474,11 +501,12 @@ def train() -> None:
         model.train()
         opt.zero_grad(set_to_none=True)
         tot = {"pg": 0.0, "ent": 0.0, "clipfrac": 0.0, "kl": 0.0}
-        for i in range(0, BATCH, MICRO):
-            mb = batch[i:i + MICRO]
+        micro = s.get("micro", MICRO)
+        for i in range(0, BATCH, micro):
+            mb = batch[i:i + micro]
             lg = sc.logits([d["prompt"] for d in mb], [d["n"] for d in mb], grad=True)
             loss = 0.0
-            for d, l, a in zip(mb, lg, adv[i:i + MICRO]):
+            for d, l, a in zip(mb, lg, adv[i:i + micro]):
                 lp = torch.log_softmax(l / R["temp"], -1)
                 ratio = torch.exp(lp[d["a"]] - d["logp"])
                 a = a.to(DEVICE)
@@ -539,7 +567,8 @@ def train_loop(s, sc, model, opt, buffer, traj, pool, save_ckpt, add_pool, tick,
                 answers.append({"id": r["id"], "choice": a})
                 if tag == "learner":
                     traj.setdefault(f"{r['job']}:{r['idx']}:{r['seat']}", []).append(
-                        {"prompt": r["prompt"], "n": r["n"], "a": a, "logp": lp, "phi": (r["lp"][0] - r["lp"][1]) / 8000})
+                        {"prompt": r["prompt"], "n": r["n"], "a": a, "logp": lp, "phi": (r["lp"][0] - r["lp"][1]) / 8000,
+                         "turn": r.get("turn")})
                     s["decisions"] += 1
         if answers:
             server_call("/answer", answers)
@@ -580,7 +609,7 @@ def train_loop(s, sc, model, opt, buffer, traj, pool, save_ckpt, add_pool, tick,
             if wr >= TARGET or done:
                 reason = "target" if wr >= TARGET else "cap"
                 server_call("/cancel", {})
-                log("train_stop", reason=reason, step=s["step"], gpu_h=round(s["gpu_s"] / 3600, 2), vs_random=wr,
+                log("train_stop", reason=reason, step=s["step"], gpu_h=round(s["gpu_s"] / 3600, 2), vs_windbot=wr,
                     msg=f"train_stop reason={reason}")
                 (DATA / "done-train").write_text(reason)
                 return
@@ -635,7 +664,7 @@ def table() -> None:
     out = DATA / "table.json"
     rows = json.loads(out.read_text()) if out.exists() else {}
     for p in picks:
-        for opp in ("random", "zeroshot", "prev"):
+        for opp in ("windbot", "zeroshot", "random", "prev"):
             key = f"{p['name']}:{opp}"
             if key in rows:
                 continue
@@ -656,12 +685,13 @@ def table() -> None:
                          "opp_name": prev[p["name"]] if opp == "prev" else opp, **res}
             save_json(out, rows)
             log("table_row", **{k: rows[key][k] for k in ("ckpt", "opp", "opp_name", "games", "win_rate", "errors")})
-    lines = [f"{'checkpoint':<12} {'step':>6} {'gpu_h':>6}  {'vs_random':>9}  {'vs_zeroshot':>8}  {'vs_previous':>18}  errors"]
+    lines = [f"{'checkpoint':<12} {'step':>6} {'gpu_h':>6}  {'vs_windbot':>10}  {'vs_zeroshot':>8}  {'vs_random':>9}  {'vs_previous':>18}  errors"]
     for p in picks:
-        r = {o: rows[f"{p['name']}:{o}"] for o in ("random", "zeroshot", "prev")}
+        r = {o: rows[f"{p['name']}:{o}"] for o in ("windbot", "zeroshot", "random", "prev")}
         err = sum(x["errors"] for x in r.values())
-        lines.append(f"{p['name']:<12} {p['step']:>6} {p['gpu_h']:>6}  {r['random']['win_rate']:>9.2f}  "
-                     f"{r['zeroshot']['win_rate']:>8.2f}  {r['prev']['win_rate']:>5.2f} ({r['prev']['opp_name']:>10})  {err}")
+        lines.append(f"{p['name']:<12} {p['step']:>6} {p['gpu_h']:>6}  {r['windbot']['win_rate']:>10.2f}  "
+                     f"{r['zeroshot']['win_rate']:>8.2f}  {r['random']['win_rate']:>9.2f}  "
+                     f"{r['prev']['win_rate']:>5.2f} ({r['prev']['opp_name']:>10})  {err}")
     total_games = sum(x["games"] for x in rows.values())
     lines.append(f"table_games={total_games} errors={sum(x['errors'] for x in rows.values())} "
                  f"(each row: 100 games per opponent, greedy, half as first player; draws count as non-wins)")

@@ -135,6 +135,30 @@ impl Board {
         t
     }
 
+    /// Effect text, once per card: my hand and field, the opponent's face-up field cards, then any other card
+    /// the options name. Graveyards stay names only.
+    pub fn card_texts(&self, lib: &Library, me: u8, option_codes: &[u32]) -> String {
+        let me = (me & 1) as usize;
+        let (m, o) = (&self.sides[me], &self.sides[1 - me]);
+        let mut codes: Vec<u32> = Vec::new();
+        let faceup = |c: &&CardView| c.pos & 0x5 != 0;
+        let mine = m.hand.iter().chain(m.mzone.iter().flatten()).chain(m.szone.iter().flatten());
+        let theirs = o.mzone.iter().flatten().chain(o.szone.iter().flatten()).filter(faceup);
+        for code in mine.chain(theirs).map(|c| c.code).chain(option_codes.iter().copied()) {
+            if code != 0 && !codes.contains(&code) {
+                codes.push(code);
+            }
+        }
+        if codes.is_empty() {
+            return String::new();
+        }
+        let mut t = String::from("Card text:\n");
+        for c in codes {
+            t += &format!("- {}\n", lib.text_line(c));
+        }
+        t
+    }
+
     /// Full board for the viewer. A card is [code, position, atk, def, public, type]; names go in `names`.
     pub fn to_json(&self, lib: &Library, names: &mut BTreeMap<u32, String>) -> Value {
         let mut card = |c: &CardView| {
@@ -226,8 +250,8 @@ fn spells(lib: &Library, zones: &[Option<CardView>], mine: bool) -> String {
 /// Options lettered A-Z then a-z; the model answers with one letter (a single token in Qwen's vocabulary).
 pub const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-pub fn prompt(board_text: &str, kind: &str, options: &[String]) -> String {
-    let mut t = format!("{board_text}Decision: {kind}.\nOptions:\n");
+pub fn prompt(board_text: &str, card_texts: &str, kind: &str, options: &[String]) -> String {
+    let mut t = format!("{board_text}{card_texts}Decision: {kind}.\nOptions:\n");
     for (i, o) in options.iter().enumerate() {
         t += &format!("{}. {o}\n", LETTERS.as_bytes()[i] as char);
     }

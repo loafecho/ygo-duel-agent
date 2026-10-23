@@ -3,7 +3,7 @@ Description=ygo-duel-agent game server for the GPU worker (:8765)
 After=network-online.target
 
 [Service]
-ExecStart=/srv/ygo/runner/target/release/ygo-runner serve --listen 0.0.0.0:8765 --threads 96 --log /srv/ygo/logs/serve-games.jsonl
+ExecStart=/srv/ygo/runner/target/release/ygo-runner serve --listen 0.0.0.0:8765 --threads 96 --log /srv/ygo/logs/serve-games.jsonl --deck /srv/ygo/AI_CyberDragon.ydk
 WorkingDirectory=/srv/ygo/runner
 Restart=always
 RestartSec=3

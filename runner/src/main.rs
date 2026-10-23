@@ -10,6 +10,7 @@ mod decide;
 mod duel;
 mod ffi;
 mod rng;
+mod windbot;
 
 use duel::{Agent, Ctx, Outcome, RandomAgent};
 use std::io::Write;

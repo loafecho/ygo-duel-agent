@@ -23,6 +23,8 @@ pub struct Card {
     pub link_marker: u32,
     pub name: String,
     pub strs: Vec<String>,
+    /// Effect text (texts.desc), newlines collapsed to spaces.
+    pub text: String,
 }
 
 pub struct Library {
@@ -42,7 +44,7 @@ impl Library {
                 .map_err(|e| format!("{}: {e}", db.display()))?;
             let cols: String = (1..=16).map(|i| format!(",t.str{i}")).collect();
             let sql = format!(
-                "select d.id,d.alias,d.setcode,d.type,d.atk,d.def,d.level,d.race,d.attribute,t.name{cols} \
+                "select d.id,d.alias,d.setcode,d.type,d.atk,d.def,d.level,d.race,d.attribute,t.name{cols},t.desc \
                  from datas d join texts t on t.id=d.id"
             );
             let mut st = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -75,6 +77,7 @@ impl Library {
                         link_marker: if link { def as u32 } else { 0 },
                         name: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
                         strs,
+                        text: r.get::<_, Option<String>>(26)?.unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" "),
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -125,6 +128,14 @@ impl Library {
             }
         }
         if d == 0 { String::new() } else { format!("system string {d}") }
+    }
+
+    /// "Name: effect text" for the prompt's card-text section.
+    pub fn text_line(&self, code: u32) -> String {
+        match self.cards.get(&code) {
+            Some(c) if !c.text.is_empty() => format!("{}: {}", c.name, c.text),
+            _ => self.name(code),
+        }
     }
 
     pub fn has_script(&self, name: &str) -> bool {

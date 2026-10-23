@@ -4,6 +4,7 @@ use crate::data::{self, Library};
 use crate::decide::{self, Decision, Reader};
 use crate::ffi::*;
 use crate::rng::Rng;
+use crate::windbot::WindBot;
 use std::ffi::CString;
 use std::os::raw::c_void;
 use serde_json::{json, Value};
@@ -38,9 +39,26 @@ pub trait Agent {
     fn wants_board(&self) -> bool {
         false
     }
+    /// A WindBot seat: sees the engine's messages and answers with its own response bytes.
+    fn windbot(&mut self) -> Option<&mut WindBot> {
+        None
+    }
 }
 
 pub struct RandomAgent;
+
+/// A seat played by WindBot. `choose` is only used when the engine rejects the bot's answer
+/// (or the turn's loop breaker fires): then it answers randomly.
+pub struct WindBotAgent(pub WindBot);
+
+impl Agent for WindBotAgent {
+    fn choose(&mut self, d: &Decision, _: &Ctx, rng: &mut Rng) -> Result<usize, String> {
+        Ok(rng.below(d.choices.len()))
+    }
+    fn windbot(&mut self) -> Option<&mut WindBot> {
+        Some(&mut self.0)
+    }
+}
 
 impl Agent for RandomAgent {
     fn choose(&mut self, d: &Decision, _: &Ctx, rng: &mut Rng) -> Result<usize, String> {
@@ -63,6 +81,8 @@ pub struct GameResult {
     pub lp: [i64; 2],
     pub max_choices: usize,
     pub loop_breaks: u32,
+    /// [seat, turn] for every turn where the loop breaker took over from that seat (for the loop penalty).
+    pub loop_turns: Vec<[u32; 2]>,
     /// One entry per decision when recording: options, the choice made, and the board when it changed.
     pub steps: Vec<Value>,
     pub names: BTreeMap<u32, String>,
@@ -121,6 +141,11 @@ pub fn play(
         }
     }
     unsafe { OCG_StartDuel(duel.0) };
+    for a in agents.iter_mut() {
+        if let Some(w) = a.windbot() {
+            w.start(duel.0)?;
+        }
+    }
 
     let mut view = View { turn: 0, turn_player: 0, phase: 0, lp: [8000, 8000] };
     let (mut decisions, mut retries, mut retry_streak, mut max_choices) = (0u32, 0u32, 0u32, 0usize);
@@ -130,7 +155,8 @@ pub fn play(
     let mut last: Option<Vec<u8>> = None; // last decision message, re-asked after MSG_RETRY
     let mut unselected: Vec<decide::CardKey> = Vec::new();
     let (mut turn_seen, mut turn_decisions, mut loop_breaks) = (0u32, [0u32; 2], 0u32);
-    let finish = |outcome, view: &View, decisions, retries, max_choices, steps, names, loop_breaks| GameResult {
+    let mut loop_turns: Vec<[u32; 2]> = Vec::new();
+    let finish = |outcome, view: &View, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns| GameResult {
         outcome,
         turns: view.turn,
         decisions,
@@ -141,6 +167,7 @@ pub fn play(
         steps,
         names,
         loop_breaks,
+        loop_turns,
     };
     loop {
         let status = unsafe { OCG_DuelProcess(duel.0) };
@@ -158,6 +185,11 @@ pub fn play(
             }
             let msg = &buf[pos..pos + n];
             pos += n;
+            for a in agents.iter_mut() {
+                if let Some(w) = a.windbot() {
+                    w.observe(msg)?;
+                }
+            }
             let mut r = Reader::new(&msg[1..]);
             match msg[0] {
                 decide::MSG_RETRY => retry = true,
@@ -173,13 +205,13 @@ pub fn play(
                         let b = Board::read(duel.0, view.turn, view.turn_player, view.phase, view.lp)?;
                         steps.push(json!({"i": decisions, "end": true, "winner": if p > 1 { -1 } else { p as i32 }, "board": b.to_json(lib, &mut names)}));
                     }
-                    return Ok(finish(outcome, &view, decisions, retries, max_choices, steps, names, loop_breaks));
+                    return Ok(finish(outcome, &view, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns));
                 }
                 decide::MSG_NEW_TURN => {
                     view.turn += 1;
                     view.turn_player = r.u8()?;
                     if view.turn > TURN_LIMIT {
-                        return Ok(finish(Outcome::Draw { reason: "turn limit" }, &view, decisions, retries, max_choices, steps, names, loop_breaks));
+                        return Ok(finish(Outcome::Draw { reason: "turn limit" }, &view, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns));
                     }
                 }
                 decide::MSG_NEW_PHASE => view.phase = r.u16()?,
@@ -239,7 +271,7 @@ pub fn play(
         let need_board = record || live.is_some() || (d.choices.len() > 1 && agents[who].wants_board());
         let board = if need_board { Some(Board::read(duel.0, view.turn, view.turn_player, view.phase, view.lp)?) } else { None };
         let options: Vec<String> = d.choices.iter().map(|c| c.text.clone()).collect();
-        let prompt = board.as_ref().map(|b| board::prompt(&b.describe(lib, d.player), d.kind, &options));
+        let prompt = board.as_ref().map(|b| board::prompt(&b.describe(lib, d.player), &b.card_texts(lib, d.player, &d.codes), d.kind, &options));
         if view.turn != turn_seen {
             turn_seen = view.turn;
             turn_decisions = [0, 0];
@@ -248,8 +280,29 @@ pub fn play(
         let looping = turn_decisions[who] > TURN_DECISION_LIMIT;
         if turn_decisions[who] == TURN_DECISION_LIMIT + 1 {
             loop_breaks += 1;
+            loop_turns.push([who as u32, view.turn]);
         }
-        let i = if looping {
+        // A WindBot seat answers with its own bytes unless the engine just rejected its answer to this
+        // same message (then this one decision is random, counted in windbot_fallbacks).
+        let rejected = retry_streak > 0;
+        let wb_resp = match agents[who].windbot() {
+            Some(w) if !looping && !rejected => Some(w.respond(duel.0, &msg)?),
+            Some(w) => {
+                w.fallbacks += rejected as u32;
+                None
+            }
+            None => None,
+        };
+        let mut options = options;
+        let i = if let Some(resp) = &wb_resp {
+            match d.choices.iter().position(|c| &c.resp == resp) {
+                Some(k) => k,
+                None => {
+                    options.push("WindBot's own answer (not among the listed samples)".into());
+                    options.len() - 1
+                }
+            }
+        } else if looping {
             rng.below(d.choices.len())
         } else {
             agents[who].choose(&d, &Ctx { view: &view, prompt: prompt.as_deref() }, &mut rng)?
@@ -262,7 +315,10 @@ pub fn play(
         if let Some(Some(k)) = d.unselects.get(i) {
             unselected.push(*k);
         }
-        let c = d.choices.get(i).ok_or_else(|| format!("agent chose {i} of {}", d.choices.len()))?;
+        let resp: &[u8] = match &wb_resp {
+            Some(r) => r,
+            None => &d.choices.get(i).ok_or_else(|| format!("agent chose {i} of {}", d.choices.len()))?.resp,
+        };
         if record {
             let b = board.as_ref().unwrap().to_json(lib, &mut names);
             let text = b.to_string();
@@ -273,7 +329,7 @@ pub fn play(
             }
             steps.push(step);
         }
-        unsafe { OCG_DuelSetResponse(duel.0, c.resp.as_ptr() as *const c_void, c.resp.len() as u32) };
+        unsafe { OCG_DuelSetResponse(duel.0, resp.as_ptr() as *const c_void, resp.len() as u32) };
         last = Some(msg);
     }
 }
