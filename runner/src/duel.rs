@@ -2,6 +2,7 @@
 use crate::board::{self, Board};
 use crate::data::{self, Library};
 use crate::decide::{self, Decision, Reader};
+use crate::history::{self, History};
 use crate::ffi::*;
 use crate::rng::Rng;
 use crate::windbot::WindBot;
@@ -31,7 +32,16 @@ pub struct View {
 pub struct Ctx<'a> {
     pub view: &'a View,
     pub prompt: Option<&'a str>,
+    /// The full board (hidden cards included): only test probes (the leak check) may read it.
+    pub board: Option<&'a Board>,
+    /// Codes the engine revealed to both players (MSG_CONFIRM_CARDS outside the deck): for the leak check.
+    pub revealed: &'a [u32],
+    /// With TRACE_PUBLIC on: every code seen face-up (field, GY, face-up banished) after any engine message batch.
+    pub seen_public: &'a [u32],
 }
+
+/// Leak check only: sample the full board after every engine message batch (slow).
+pub static TRACE_PUBLIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub trait Agent {
     /// Index into d.choices.
@@ -47,20 +57,49 @@ pub trait Agent {
     fn labels(&self) -> bool {
         false
     }
+    /// Round 4 DAgger: a WindBot that watches this seat and is asked for advice at each of its decisions;
+    /// the seat's own choice still goes to the engine. Advice that matches an option is logged as a label.
+    fn shadow(&mut self) -> Option<&mut WindBot> {
+        None
+    }
 }
 
 /// Imitation labels from WindBot seats, one JSON line per decision with 2+ options; YGO_LABELS sets the file.
 static LABELS: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+/// Shadow-WindBot (DAgger) labels; YGO_DAGGER_LABELS sets the file.
+static DAGGER_LABELS: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
 
 fn write_label(v: &Value) -> Result<(), String> {
+    write_to(&LABELS, "YGO_LABELS", "/srv/ygo/logs/windbot-labels.jsonl", v)
+}
+
+fn write_to(file: &std::sync::Mutex<Option<std::fs::File>>, var: &str, default: &str, v: &Value) -> Result<(), String> {
     use std::io::Write;
-    let mut g = LABELS.lock().map_err(|_| "labels lock poisoned")?;
+    let mut g = file.lock().map_err(|_| "labels lock poisoned")?;
     if g.is_none() {
-        let path = std::env::var("YGO_LABELS").unwrap_or("/srv/ygo/logs/windbot-labels.jsonl".into());
+        let path = std::env::var(var).unwrap_or(default.into());
         *g = Some(std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| format!("labels {path}: {e}"))?);
     }
     writeln!(g.as_mut().unwrap(), "{v}").map_err(|e| format!("labels write: {e}"))
 }
+
+/// Round 4: the seed of one decision's option sampling: the game seed and the message bytes (FNV-1a), so the
+/// same message in the same game always shows the same options (also when re-asked after MSG_RETRY).
+pub fn option_seed(seed: u64, msg: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in msg {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+/// options_stable check (ygo-runner optcheck): every sampled decision's inputs and options, when set.
+#[allow(clippy::type_complexity)]
+pub static OPT_RECORD: std::sync::Mutex<Option<Vec<(u64, Vec<u8>, Vec<decide::CardKey>, Vec<((u8, u8, u32), bool)>, Vec<(String, Vec<u8>)>)>>> =
+    std::sync::Mutex::new(None);
+
+pub type Deck = (Vec<u32>, Vec<u32>);
 
 pub struct RandomAgent;
 
@@ -103,6 +142,8 @@ pub struct GameResult {
     pub loop_breaks: u32,
     /// [seat, turn] for every turn where the loop breaker took over from that seat (for the loop penalty).
     pub loop_turns: Vec<[u32; 2]>,
+    /// Shadow seats, per seat: [decisions asked, advice among the options, the seat chose otherwise].
+    pub shadow: [[u32; 3]; 2],
     /// One entry per decision when recording: options, the choice made, and the board when it changed.
     pub steps: Vec<Value>,
     pub names: BTreeMap<u32, String>,
@@ -116,7 +157,15 @@ impl Drop for DuelHandle {
 }
 
 pub fn play(
-    lib: &Library, deck: &(Vec<u32>, Vec<u32>), seed: u64, agents: &mut [&mut dyn Agent; 2], record: bool,
+    lib: &Library, deck: &Deck, seed: u64, agents: &mut [&mut dyn Agent; 2], record: bool,
+    live: Option<&dyn Fn(Value)>,
+) -> Result<GameResult, String> {
+    play2(lib, [deck, deck], seed, agents, record, live)
+}
+
+/// `decks[p]` is player p's deck (the leak check gives the opponent a deck with no card names in common).
+pub fn play2(
+    lib: &Library, decks: [&Deck; 2], seed: u64, agents: &mut [&mut dyn Agent; 2], record: bool,
     live: Option<&dyn Fn(Value)>,
 ) -> Result<GameResult, String> {
     let script_errors = AtomicUsize::new(0);
@@ -151,6 +200,7 @@ pub fn play(
         }
     }
     for team in 0..2u8 {
+        let deck = decks[team as usize];
         let mut main = deck.0.clone();
         rng.shuffle(&mut main);
         for (codes, loc) in [(&main, LOCATION_DECK), (&deck.1, LOCATION_EXTRA)] {
@@ -165,6 +215,9 @@ pub fn play(
         if let Some(w) = a.windbot() {
             w.start(duel.0)?;
         }
+        if let Some(w) = a.shadow() {
+            w.start(duel.0)?;
+        }
     }
 
     let mut view = View { turn: 0, turn_player: 0, phase: 0, lp: [8000, 8000] };
@@ -176,7 +229,13 @@ pub fn play(
     let mut unselected: Vec<decide::CardKey> = Vec::new();
     let (mut turn_seen, mut turn_decisions, mut loop_breaks) = (0u32, [0u32; 2], 0u32);
     let mut loop_turns: Vec<[u32; 2]> = Vec::new();
-    let finish = |outcome, view: &View, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns| GameResult {
+    let mut hist = History::default();
+    let mut revealed: Vec<u32> = Vec::new();
+    let mut seen_public: Vec<u32> = Vec::new();
+    let mut rejected: Vec<Vec<u8>> = Vec::new(); // answers the engine refused for the message being re-asked
+    let mut last_resp: Vec<u8> = Vec::new();
+    let mut shadow = [[0u32; 3]; 2];
+    let finish = |outcome, view: &View, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns, shadow| GameResult {
         outcome,
         turns: view.turn,
         decisions,
@@ -188,6 +247,7 @@ pub fn play(
         names,
         loop_breaks,
         loop_turns,
+        shadow,
     };
     loop {
         let status = unsafe { OCG_DuelProcess(duel.0) };
@@ -209,6 +269,21 @@ pub fn play(
                 if let Some(w) = a.windbot() {
                     w.observe(msg)?;
                 }
+                if let Some(w) = a.shadow() {
+                    w.observe(msg)?;
+                }
+            }
+            if msg[0] == 31 && msg.len() >= 6 {  // MSG_CONFIRM_CARDS: player, count u32, then code, con, loc, seq u32
+                let n = u32::from_le_bytes(msg[2..6].try_into().unwrap()) as usize;
+                for k in 0..n {
+                    let at = 6 + k * 10;
+                    if at + 10 <= msg.len() && msg[at + 5] as u32 & LOCATION_DECK == 0 {
+                        revealed.push(u32::from_le_bytes(msg[at..at + 4].try_into().unwrap()));
+                    }
+                }
+            }
+            if let Some(e) = history::event(msg, view.turn, &|c, l, q| board::card_at(duel.0, c, l, q)) {
+                hist.push(e);
             }
             let mut r = Reader::new(&msg[1..]);
             match msg[0] {
@@ -225,13 +300,13 @@ pub fn play(
                         let b = Board::read(duel.0, view.turn, view.turn_player, view.phase, view.lp)?;
                         steps.push(json!({"i": decisions, "end": true, "winner": if p > 1 { -1 } else { p as i32 }, "board": b.to_json(lib, &mut names)}));
                     }
-                    return Ok(finish(outcome, &view, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns));
+                    return Ok(finish(outcome, &view, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns, shadow));
                 }
                 decide::MSG_NEW_TURN => {
                     view.turn += 1;
                     view.turn_player = r.u8()?;
                     if view.turn > TURN_LIMIT {
-                        return Ok(finish(Outcome::Draw { reason: "turn limit" }, &view, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns));
+                        return Ok(finish(Outcome::Draw { reason: "turn limit" }, &view, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns, shadow));
                     }
                 }
                 decide::MSG_NEW_PHASE => view.phase = r.u16()?,
@@ -251,6 +326,18 @@ pub fn play(
                 _ => {}
             }
         }
+        if TRACE_PUBLIC.load(Ordering::Relaxed) && !buf.is_empty() {
+            let b = Board::read(duel.0, view.turn, view.turn_player, view.phase, view.lp)?;
+            for side in &b.sides {
+                let up = |c: &&board::CardView| c.pos & 0x5 != 0;
+                for c in side.mzone.iter().flatten().chain(side.szone.iter().flatten()).filter(up)
+                    .chain(side.grave.iter()).chain(side.banished.iter().filter(up)) {
+                    if !seen_public.contains(&c.code) {
+                        seen_public.push(c.code);
+                    }
+                }
+            }
+        }
         match status {
             OCG_DUEL_STATUS_END => return Err("duel ended without MSG_WIN".into()),
             OCG_DUEL_STATUS_CONTINUE => continue,
@@ -260,6 +347,7 @@ pub fn play(
         let msg = match (pending, retry) {
             (Some(m), _) => {
                 retry_streak = 0;
+                rejected.clear();
                 m
             }
             (None, true) => {
@@ -268,11 +356,33 @@ pub fn play(
                 if retry_streak > RETRY_LIMIT {
                     return Err(format!("engine rejected {RETRY_LIMIT} answers in a row (msg {:?})", last.as_ref().map(|m| m[0])));
                 }
+                rejected.push(last_resp.clone());
                 last.clone().ok_or("MSG_RETRY before any decision")?
             }
             (None, false) => return Err("engine awaiting a response but sent no decision message".into()),
         };
-        let d = decide::parse(&msg, lib, &mut rng, &unselected)?;
+        let asked = std::cell::RefCell::new(Vec::new()); // the visibility answers, kept for optcheck's re-parse
+        let public = |c: u8, l: u8, q: u32| {
+            let v = board::card_at(duel.0, c, l, q).map(|x| x.pos & 0x5 != 0).unwrap_or(false);
+            asked.borrow_mut().push(((c, l, q), v));
+            v
+        };
+        let mut d = decide::parse(&msg, lib, &mut Rng::new(option_seed(seed, &msg)), &unselected, &public)?;
+        if let Ok(mut g) = OPT_RECORD.lock() {
+            if let Some(v) = g.as_mut() {
+                v.push((seed, msg.clone(), unselected.clone(), asked.take(),
+                    d.choices.iter().map(|c| (c.text.clone(), c.resp.clone())).collect()));
+            }
+        }
+        if !rejected.is_empty() {  // re-asked: the same options minus the ones the engine refused
+            let keep: Vec<bool> = d.choices.iter().map(|c| !rejected.contains(&c.resp)).collect();
+            let mut k = keep.iter();
+            d.choices.retain(|_| *k.next().unwrap());
+            if !d.unselects.is_empty() {
+                let mut k = keep.iter();
+                d.unselects.retain(|_| *k.next().unwrap());
+            }
+        }
         if d.msg != 26 {
             unselected.clear();
         }
@@ -293,7 +403,8 @@ pub fn play(
         let board = if need_board { Some(Board::read(duel.0, view.turn, view.turn_player, view.phase, view.lp)?) } else { None };
         let options: Vec<String> = d.choices.iter().map(|c| c.text.clone()).collect();
         let texts = board.as_ref().map(|b| (b.describe(lib, d.player), b.card_texts(lib, d.player, &d.codes)));
-        let prompt = texts.as_ref().map(|(bt, ct)| board::prompt(bt, ct, d.kind, &options));
+        let hist_text = if board.is_some() { hist.render(lib, d.player) } else { String::new() };
+        let prompt = texts.as_ref().map(|(bt, ct)| board::prompt(bt, &hist_text, ct, d.kind, &options));
         if view.turn != turn_seen {
             turn_seen = view.turn;
             turn_decisions = [0, 0];
@@ -306,11 +417,11 @@ pub fn play(
         }
         // A WindBot seat answers with its own bytes unless the engine just rejected its answer to this
         // same message (then this one decision is random, counted in windbot_fallbacks).
-        let rejected = retry_streak > 0;
+        let rejected_now = retry_streak > 0;
         let wb_resp = match agents[who].windbot() {
-            Some(w) if !looping && !rejected => Some(w.respond(duel.0, &msg)?),
+            Some(w) if !looping && !rejected_now => Some(w.respond(duel.0, &msg)?),
             Some(w) => {
-                w.fallbacks += rejected as u32;
+                w.fallbacks += rejected_now as u32;
                 None
             }
             None => None,
@@ -322,7 +433,7 @@ pub fn play(
                     if label {
                         let (bt, ct) = texts.as_ref().unwrap();
                         write_label(&json!({"seed": seed, "turn": view.turn, "player": d.player & 1, "kind": d.kind,
-                            "state": bt, "cards": ct, "options": options, "choice": k}))?;
+                            "state": bt, "history": hist_text, "cards": ct, "options": options, "choice": k}))?;
                     }
                     k
                 }
@@ -334,8 +445,22 @@ pub fn play(
         } else if looping {
             rng.below(d.choices.len())
         } else {
-            agents[who].choose(&d, &Ctx { view: &view, prompt: prompt.as_deref() }, &mut rng)?
+            agents[who].choose(&d, &Ctx { view: &view, prompt: prompt.as_deref(), board: board.as_ref(), revealed: &revealed, seen_public: &seen_public }, &mut rng)?
         };
+        if d.choices.len() > 1 && !looping && !rejected_now {
+            if let Some(w) = agents[who].shadow() {
+                let advice = w.respond(duel.0, &msg)?;
+                shadow[who][0] += 1;
+                if let Some(k) = d.choices.iter().position(|c| c.resp == advice) {
+                    shadow[who][1] += 1;
+                    shadow[who][2] += (k != i) as u32;
+                    let (bt, ct) = texts.as_ref().ok_or("shadow seat without a board")?;
+                    write_to(&DAGGER_LABELS, "YGO_DAGGER_LABELS", "/srv/ygo/logs/dagger-labels.jsonl",
+                        &json!({"seed": seed, "turn": view.turn, "player": d.player & 1, "kind": d.kind, "state": bt,
+                            "history": hist_text, "cards": ct, "options": options, "choice": k, "model_choice": i}))?;
+                }
+            }
+        }
         if let Some(f) = live {
             let mut n = BTreeMap::new();
             let b = board.as_ref().unwrap().to_json(lib, &mut n);
@@ -358,6 +483,7 @@ pub fn play(
             }
             steps.push(step);
         }
+        last_resp = resp.to_vec();
         unsafe { OCG_DuelSetResponse(duel.0, resp.as_ptr() as *const c_void, resp.len() as u32) };
         last = Some(msg);
     }

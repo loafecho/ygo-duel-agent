@@ -89,6 +89,11 @@ fn query(duel: OCG_Duel, con: u8, loc: u32) -> Result<Vec<Option<CardView>>, Str
     Ok(out)
 }
 
+/// The card at one location (history.rs: attack messages carry locations, not codes).
+pub fn card_at(duel: OCG_Duel, con: u8, loc: u8, seq: u32) -> Option<CardView> {
+    query(duel, con, loc as u32).ok()?.into_iter().nth(seq as usize).flatten()
+}
+
 impl Board {
     pub fn read(duel: OCG_Duel, turn: u32, turn_player: u8, phase: u16, lp: [i64; 2]) -> Result<Board, String> {
         let mut sides: [Side; 2] = Default::default();
@@ -257,8 +262,9 @@ fn spells(lib: &Library, zones: &[Option<CardView>], mine: bool) -> String {
 /// Options lettered A-Z then a-z; the model answers with one letter (a single token in Qwen's vocabulary).
 pub const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-pub fn prompt(board_text: &str, card_texts: &str, kind: &str, options: &[String]) -> String {
-    let mut t = format!("{board_text}{card_texts}Decision: {kind}.\nOptions:\n");
+/// Round 4: `history` ("Recent plays", history.rs) sits between the board and the card text.
+pub fn prompt(board_text: &str, history: &str, card_texts: &str, kind: &str, options: &[String]) -> String {
+    let mut t = format!("{board_text}{history}{card_texts}Decision: {kind}.\nOptions:\n");
     for (i, o) in options.iter().enumerate() {
         t += &format!("{}. {o}\n", LETTERS.as_bytes()[i] as char);
     }

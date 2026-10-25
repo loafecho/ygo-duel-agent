@@ -31,7 +31,7 @@ while len(results) < a.games:
     for res in nxt["results"]:
         if res.get("job") == job:
             results.append(res)
-            print(json.dumps({"event": "game", "idx": res["idx"], "winner": res.get("winner"), "turns": res.get("turns"),
+            print(json.dumps({"event": "game", "idx": res["idx"], "seed": res.get("seed"), "winner": res.get("winner"), "turns": res.get("turns"),
                               "error": res.get("error"), "windbot": res.get("windbot")}), flush=True)
 errors = sum("error" in r for r in results)
 fallbacks = sum(w.get("fallbacks", 0) for r in results for w in r.get("windbot") or [])

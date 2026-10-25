@@ -123,9 +123,20 @@ fn note(code: u32) {
     });
 }
 
-fn card_text(lib: &Library, code: u32, me: u8, con: u8, loc: u8) -> String {
-    note(code);
+/// Is the card at (controller, location, sequence) public? Asked for the opponent's cards only.
+pub type Public<'a> = &'a dyn Fn(u8, u8, u32) -> bool;
+
+/// Round 4: an opponent's card the decider can't see is named "a face-down card" and its text is not added
+/// (round 3 named face-down cards in select options, a leak the leak check found). Graveyard cards are public;
+/// field and banished cards are public when face-up; hand, deck and extra-deck cards are hidden.
+fn card_text(lib: &Library, code: u32, me: u8, con: u8, loc: u8, seq: u32, public: Public) -> String {
     let whose = if con == me { "my" } else { "opponent's" };
+    let shown = con == me || loc & 0x10 != 0
+        || (loc & (0x04 | 0x08 | 0x20) != 0 && public(con, loc, seq));
+    if !shown {
+        return format!("a face-down card ({whose} {})", loc_name(loc));
+    }
+    note(code);
     format!("{} ({whose} {})", lib.name(code), loc_name(loc))
 }
 
@@ -136,7 +147,7 @@ fn push_unique(out: &mut Vec<Choice>, c: Choice) {
 }
 
 /// `unselected`: cards taken back earlier in the current select/unselect sequence (not offered again).
-pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -> Result<Decision, String> {
+pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey], public: Public) -> Result<Decision, String> {
     let t = msg[0];
     MENTIONED.with(|m| m.borrow_mut().clear());
     let mut r = Reader::new(&msg[1..]);
@@ -149,19 +160,19 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -
             kind = "battle phase command";
             let n = r.u32()?;
             for i in 0..n {
-                let (code, con, loc, _seq, desc) = (r.u32()?, r.u8()?, r.u8()?, r.u32()?, r.u64()?);
+                let (code, con, loc, seq, desc) = (r.u32()?, r.u8()?, r.u8()?, r.u32()?, r.u64()?);
                 r.u8()?;
                 ch.push(Choice {
-                    text: format!("activate {}: {}", card_text(lib, code, player, con, loc), lib.desc(desc)),
+                    text: format!("activate {}: {}", card_text(lib, code, player, con, loc, seq, public), lib.desc(desc)),
                     resp: i32r(((i as i32) << 16) | 0),
                 });
             }
             let n = r.u32()?;
             for i in 0..n {
-                let (code, con, loc, _seq, direct) = (r.u32()?, r.u8()?, r.u8()?, r.u8()?, r.u8()?);
+                let (code, con, loc, seq, direct) = (r.u32()?, r.u8()?, r.u8()?, r.u8()? as u32, r.u8()?);
                 let how = if direct != 0 { " (can attack directly)" } else { "" };
                 ch.push(Choice {
-                    text: format!("attack with {}{how}", card_text(lib, code, player, con, loc)),
+                    text: format!("attack with {}{how}", card_text(lib, code, player, con, loc, seq, public)),
                     resp: i32r(((i as i32) << 16) | 1),
                 });
             }
@@ -180,19 +191,19 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -
                 for i in 0..n {
                     let code = r.u32()?;
                     let (con, loc) = (r.u8()?, r.u8()?);
-                    if ti == 2 { r.u8()?; } else { r.u32()?; }
+                    let seq = if ti == 2 { r.u8()? as u32 } else { r.u32()? };
                     ch.push(Choice {
-                        text: format!("{verb} {}", card_text(lib, code, player, con, loc)),
+                        text: format!("{verb} {}", card_text(lib, code, player, con, loc, seq, public)),
                         resp: i32r(((i as i32) << 16) | ti as i32),
                     });
                 }
             }
             let n = r.u32()?;
             for i in 0..n {
-                let (code, con, loc, _seq, desc) = (r.u32()?, r.u8()?, r.u8()?, r.u32()?, r.u64()?);
+                let (code, con, loc, seq, desc) = (r.u32()?, r.u8()?, r.u8()?, r.u32()?, r.u64()?);
                 r.u8()?;
                 ch.push(Choice {
-                    text: format!("activate {}: {}", card_text(lib, code, player, con, loc), lib.desc(desc)),
+                    text: format!("activate {}: {}", card_text(lib, code, player, con, loc, seq, public), lib.desc(desc)),
                     resp: i32r(((i as i32) << 16) | 5),
                 });
             }
@@ -207,9 +218,9 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -
         12 => {
             kind = "use an effect?";
             let code = r.u32()?;
-            let (con, loc, _) = r.loc_info()?;
+            let (con, loc, seq) = r.loc_info()?;
             let desc = r.u64()?;
-            let what = format!("{}: {}", card_text(lib, code, player, con, loc), lib.desc(desc));
+            let what = format!("{}: {}", card_text(lib, code, player, con, loc, seq, public), lib.desc(desc));
             ch.push(Choice { text: format!("yes, use {what}"), resp: i32r(1) });
             ch.push(Choice { text: format!("no, skip {what}"), resp: i32r(0) });
         }
@@ -233,8 +244,8 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -
             let mut cards = Vec::with_capacity(n);
             for _ in 0..n {
                 let code = r.u32()?;
-                let (con, loc, _) = r.loc_info()?;
-                cards.push(card_text(lib, code, player, con, loc));
+                let (con, loc, seq) = r.loc_info()?;
+                cards.push(card_text(lib, code, player, con, loc, seq, public));
             }
             if cancel {
                 ch.push(Choice { text: "select nothing / cancel".into(), resp: i32r(-1) });
@@ -269,11 +280,11 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -
             }
             for i in 0..n {
                 let code = r.u32()?;
-                let (con, loc, _) = r.loc_info()?;
+                let (con, loc, seq) = r.loc_info()?;
                 let desc = r.u64()?;
                 r.u8()?;
                 ch.push(Choice {
-                    text: format!("chain {}: {}", card_text(lib, code, player, con, loc), lib.desc(desc)),
+                    text: format!("chain {}: {}", card_text(lib, code, player, con, loc, seq, public), lib.desc(desc)),
                     resp: i32r(i as i32),
                 });
             }
@@ -327,8 +338,8 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -
             let (min, max, n) = (r.u32()? as usize, r.u32()? as usize, r.u32()? as usize);
             let mut cards = Vec::with_capacity(n);
             for _ in 0..n {
-                let (code, con, loc, _seq, rel) = (r.u32()?, r.u8()?, r.u8()?, r.u32()?, r.u8()?);
-                cards.push((card_text(lib, code, player, con, loc), rel as usize));
+                let (code, con, loc, seq, rel) = (r.u32()?, r.u8()?, r.u8()?, r.u32()?, r.u8()?);
+                cards.push((card_text(lib, code, player, con, loc, seq, public), rel as usize));
             }
             if cancel {
                 ch.push(Choice { text: "cancel".into(), resp: i32r(-1) });
@@ -426,8 +437,8 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -
             let mut cards = Vec::with_capacity(n);
             for _ in 0..n {
                 let code = r.u32()?;
-                let (con, loc, _) = r.loc_info()?;
-                cards.push((card_text(lib, code, player, con, loc), r.u32()? as i32));
+                let (con, loc, seq) = r.loc_info()?;
+                cards.push((card_text(lib, code, player, con, loc, seq, public), r.u32()? as i32));
             }
             let mut order: Vec<usize> = (0..n).collect();
             rng.shuffle(&mut order);
@@ -457,7 +468,7 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -
                 let (con, loc, seq) = r.loc_info()?;
                 let mut resp = i32r(1);
                 resp.extend(i32r(i));
-                sel.push((Choice { text: format!("select {}", card_text(lib, code, player, con, loc)), resp }, (con, loc, seq, code)));
+                sel.push((Choice { text: format!("select {}", card_text(lib, code, player, con, loc, seq, public)), resp }, (con, loc, seq, code)));
                 i += 1;
             }
             let mut unsel: Vec<(Choice, CardKey)> = Vec::new();
@@ -467,7 +478,7 @@ pub fn parse(msg: &[u8], lib: &Library, rng: &mut Rng, unselected: &[CardKey]) -
                 let (con, loc, seq) = r.loc_info()?;
                 let mut resp = i32r(1);
                 resp.extend(i32r(i));
-                unsel.push((Choice { text: format!("unselect {}", card_text(lib, code, player, con, loc)), resp }, (con, loc, seq, code)));
+                unsel.push((Choice { text: format!("unselect {}", card_text(lib, code, player, con, loc, seq, public)), resp }, (con, loc, seq, code)));
                 i += 1;
             }
             let (fresh, stale): (Vec<(Choice, CardKey)>, Vec<(Choice, CardKey)>) =

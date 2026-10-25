@@ -159,14 +159,16 @@ impl Broker {
         for (i, g) in games.iter().enumerate() {
             let seats = g["seats"].as_array().ok_or("need seats")?;
             let seat = |k: usize| seats.get(k).and_then(|s| s.as_str()).map(String::from).ok_or("seat must be a string");
-            specs.push((i as u32, [seat(0)?, seat(1)?], g["replay"].as_bool().unwrap_or(false), g["live"].as_bool().unwrap_or(false)));
+            specs.push((i as u32, [seat(0)?, seat(1)?], g["replay"].as_bool().unwrap_or(false), g["live"].as_bool().unwrap_or(false),
+                g["seed"].as_u64()));
         }
         let (m, cv) = &*self.0;
         let mut st = m.lock().unwrap();
         st.next_job += 1;
         let job = st.next_job;
-        for (idx, seats, replay, live) in specs {
-            let seed = seed.wrapping_mul(1_000_003).wrapping_add(job << 32).wrapping_add(idx as u64);
+        for (idx, seats, replay, live, own_seed) in specs {
+            // round 4: a game may carry its own seed (paired games: the same deal with the seats swapped)
+            let seed = own_seed.unwrap_or(seed.wrapping_mul(1_000_003).wrapping_add(job << 32).wrapping_add(idx as u64));
             st.queue.push_back(GameSpec { job, idx, seed, seats, replay, live, name: name.clone() });
             *st.active.entry(job).or_insert(0) += 1;
         }
@@ -317,6 +319,21 @@ impl Agent for RemoteAgent<'_> {
     }
 }
 
+/// Round 4 DAgger: a remote seat (policy "shadow:<tag>", the worker sees <tag>) with a WindBot watching it.
+pub struct ShadowAgent<'a>(pub RemoteAgent<'a>, pub crate::windbot::WindBot);
+
+impl Agent for ShadowAgent<'_> {
+    fn wants_board(&self) -> bool {
+        true
+    }
+    fn choose(&mut self, d: &Decision, ctx: &Ctx, rng: &mut Rng) -> Result<usize, String> {
+        self.0.choose(d, ctx, rng)
+    }
+    fn shadow(&mut self) -> Option<&mut crate::windbot::WindBot> {
+        Some(&mut self.1)
+    }
+}
+
 /// Game threads: each takes the next queued game, plays it, and posts the result.
 pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32>)>, threads: usize, replay_dir: PathBuf) {
     let _ = std::fs::create_dir_all(&replay_dir);
@@ -334,6 +351,16 @@ pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32
                     let server = std::env::var("YGO_WINDBOT").unwrap_or("127.0.0.1:2399".into());
                     match crate::windbot::WindBot::connect(&server, "CyberDragon", k as u8, "WindBot") {
                         Ok(w) => agents.push(Box::new(WindBotAgent(w, pol == "windbot-labels"))),
+                        Err(e) => {
+                            seat_error = Some(e);
+                            agents.push(Box::new(RandomAgent));
+                        }
+                    }
+                } else if let Some(inner) = pol.strip_prefix("shadow:") {
+                    let server = std::env::var("YGO_WINDBOT").unwrap_or("127.0.0.1:2399".into());
+                    let remote = RemoteAgent { broker: &b, job: g.job, idx: g.idx, seat: k as u8, policy: inner.to_string(), requests: 0 };
+                    match crate::windbot::WindBot::connect(&server, "CyberDragon", k as u8, "Shadow") {
+                        Ok(w) => agents.push(Box::new(ShadowAgent(remote, w))),
                         Err(e) => {
                             seat_error = Some(e);
                             agents.push(Box::new(RandomAgent));
@@ -381,6 +408,9 @@ pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32
                     out["max_choices"] = json!(r.max_choices);
                     out["loop_breaks"] = json!(r.loop_breaks);
                     out["loop_turns"] = json!(r.loop_turns);
+                    if g.seats.iter().any(|p| p.starts_with("shadow:")) {
+                        out["shadow"] = json!(r.shadow); // per seat: [asked, advice among the options, model chose otherwise]
+                    }
                     if g.replay {
                         let file = format!("{}-j{}-g{}.json", g.name, g.job, g.idx);
                         let rep = json!({"name": g.name, "job": g.job, "game": g.idx, "seed": g.seed, "seats": g.seats,

@@ -7,9 +7,11 @@
 # own data dir (pause-data) so the real training run's checkpoints are never touched.
 set -u
 W=~/.local/share/ygo-worker
-export YGO_DATA=$W/pause-data YGO_EVAL_GAMES=${YGO_EVAL_GAMES:-20}
-L=$YGO_DATA/logs/train.jsonl
-S=$W/logs/supervisor-train.jsonl
+# Round 4: YGO_PAUSE_MODE=practice runs the round-4 trainer instead (same criteria), in YGO_PAUSE_DATA.
+M=${YGO_PAUSE_MODE:-train}
+export YGO_DATA=${YGO_PAUSE_DATA:-$W/pause-data} YGO_EVAL_GAMES=${YGO_EVAL_GAMES:-20}
+L=$YGO_DATA/logs/$M.jsonl
+S=$W/logs/supervisor-$M.jsonl
 now() { date +%s.%N; }
 since() { awk -v a="$(now)" -v b="$1" 'BEGIN { printf "%.1f", a - b }'; }
 steps() { grep -c '"event": "step"' "$L"; }
@@ -21,7 +23,7 @@ mkdir -p "$YGO_DATA/logs"
 base=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
 echo "baseline_vram_mib=$base (before the worker starts)"
 
-setsid "$W/app/supervisor.py" train > "$W/logs/supervisor-train.out" 2>&1 < /dev/null &
+setsid "$W/app/supervisor.py" "$M" > "$W/logs/supervisor-$M.out" 2>&1 < /dev/null &
 SUP=$!
 until [ "$(steps)" -ge 20 ]; do sleep 1; done
 WPID=$(grep '"event": "started"' "$S" | tail -1 | sed 's/.*"pid": \([0-9]*\).*/\1/')
