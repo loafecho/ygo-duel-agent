@@ -71,10 +71,15 @@ ONELINERS_FILE = os.environ.get("YGO_ONELINERS", "oneliners.json")  # round 4: o
 LABELS_FILE = os.environ.get("YGO_LABELS_FILE", "")
 SL_EPOCHS = float(os.environ.get("YGO_SL_EPOCHS", "1"))
 SL_LR = float(os.environ.get("YGO_SL_LR", "1e-4"))
+SL_CAP_H = float(os.environ.get("YGO_SL_CAP_H", "0"))  # round 5: imitation stops here (GPU-h) even mid-epoch
 CAP2_H = float(os.environ.get("YGO_CAP2_H", "0"))  # round 3: at CAP_H, continue to this if the last eval beat the one before
 EVAL_OPPS = os.environ.get("YGO_EVAL_OPPS", "windbot,random").split(",")
 STOP = False
 MODE = sys.argv[1] if len(sys.argv) > 1 else ""
+# round 5: per-seat decks (WindBot deck names; "" = the game server's --deck, Cyber Dragon)
+MY_DECK = os.environ.get("YGO_DECK", "")
+POOL_DECKS = [d for d in os.environ.get("YGO_POOL_DECKS", "Blackwing,Dragunity,Zoodiac,Trickstar,ThunderDragon").split(",") if d]
+LORA_R = int(os.environ.get("YGO_LORA_R", "16"))
 
 
 def recipe() -> dict:
@@ -135,6 +140,7 @@ def save_json(p: Path, obj) -> None:
 # ------------------------------------------------------------------ card text
 
 _ONELINERS: dict[str, dict[str, str]] = {}
+_MISSING: set[str] = set()
 HISTORY = os.environ.get("YGO_HISTORY", "1") != "0"  # round 4: keep the runner's "Recent plays" section
 HIST_HEAD = "Recent plays (oldest first):\n"
 R3_FMT = {"oneliners": "oneliners.json", "history": False}  # how round-3 checkpoints saw their prompts
@@ -171,7 +177,14 @@ def render_cards(prompt: str, mode: str | None = None, oneliners: str | None = N
     for line in cards.splitlines():
         name, _, text = line.removeprefix("- ").partition(": ")
         if name not in table:  # round 4: no silent first-sentence fallback
-            raise KeyError(f"no one-line summary for {name!r} in {fname}")
+            if os.environ.get("YGO_ONELINER_STRICT", "0") == "1":
+                raise KeyError(f"no one-line summary for {name!r} in {fname}")
+            # round 5: opponents' tokens and other off-list cards: a marked, logged first sentence instead of a crash
+            if name not in _MISSING:
+                _MISSING.add(name)
+                log("oneliner_missing", card=name, file=fname)
+            lines.append(f"- {name}: (no summary) {text.split('. ')[0][:200]}")
+            continue
         lines.append(f"- {name}: {table[name]}")
     return head + "Card text:\n" + "\n".join(lines) + "\n" + sep + tail
 
@@ -338,9 +351,23 @@ def choose(sc: Scorer, reqs: list[dict], greedy: bool, temp: float = 1.0, state=
 
 # ------------------------------------------------------------------ matches (eval, zeroshot, table)
 
-def seats_vs(tag: str, opp: str, games: int) -> list[dict]:
-    """Half the games with `tag` as player 0 (goes first), half as player 1."""
-    return [{"seats": [tag, opp] if g % 2 == 0 else [opp, tag]} for g in range(games)]
+def seats_vs(tag: str, opp: str, games: int, opp_decks: list[str] | None = None) -> list[dict]:
+    """Half the games with `tag` as player 0 (goes first), half as player 1. Round 5: `tag` plays MY_DECK; with
+    `opp_decks` the opponent plays opp_decks[(g // 2) % len] (each pool deck in both seat orders)."""
+    out = [{"seats": [tag, opp] if g % 2 == 0 else [opp, tag]} for g in range(games)]
+    return with_decks(out, tag, opp_decks)
+
+
+def with_decks(games: list[dict], tag: str, opp_decks: list[str] | None = None) -> list[dict]:
+    if not MY_DECK and not opp_decks:
+        return games
+    for g, gm in enumerate(games):
+        me = gm["seats"].index(tag)
+        decks = [None, None]
+        decks[me] = MY_DECK or None
+        decks[1 - me] = opp_decks[(g // 2) % len(opp_decks)] if opp_decks else None
+        gm["decks"] = decks
+    return games
 
 
 def run_match(name: str, games: list[dict], players: dict, state_file: Path, seed: int, replay_first: int = 2,
@@ -422,8 +449,20 @@ def summarize(st: dict) -> dict:
         if r.get("shadow") and tag in r["seats"]:
             for k in range(3):
                 shadow[k] += r["shadow"][r["seats"].index(tag)][k]
+    by_deck: dict[str, list[int]] = {}  # round 5: the opponent's deck -> [wins, games]
+    turns = []
+    for res in st["results"].values():
+        if res.get("decks"):
+            d = res["decks"][1 - res["seats"].index(tag)] or "CyberDragon"
+            k = by_deck.setdefault(d, [0, 0])
+            k[0] += int(res.get("winner") == res["seats"].index(tag))
+            k[1] += 1
+        if "error" not in res:
+            turns.append(res.get("turns", 0))
     return {"name": st["name"], "tag": tag, "games": n, "loop_breaks": loop_breaks, "wins": wins, "losses": losses, "draws": draws, "errors": errors,
             "win_rate": round(wins / max(n, 1), 3), "replays": replays, "shadow": shadow,
+            "by_deck": {d: round(w / g, 3) for d, (w, g) in sorted(by_deck.items())},
+            "mean_turns": round(sum(turns) / max(1, len(turns)), 1),
             "errors_detail": [r["error"] for r in st["results"].values() if "error" in r][:5]}
 
 
@@ -770,6 +809,10 @@ def imitate(s, sc, model, opt, params, save_ckpt, add_pool, tick) -> None:
         if time.time() - t_save > SAVE_EVERY_S:
             save_ckpt("periodic")
             t_save = time.time()
+        if SL_CAP_H and s["gpu_s"] >= SL_CAP_H * 3600:
+            log("sl_cap", step=s["step"], pos=pos, of=total, gpu_h=round(s["gpu_s"] / 3600, 3),
+                msg=f"sl_cap at {SL_CAP_H} GPU-h: {pos} of {total} labels")
+            break
     held = load_labels(held=True, src="windbot")
     random.Random(0).shuffle(held)
     held = held[:2500]
@@ -792,7 +835,7 @@ def textcheck() -> None:
     held = load_labels(held=True, src="windbot")
     random.Random(0).shuffle(held)
     held = held[:n]
-    sc = Scorer(MODEL, chat=False, lora_r=16)
+    sc = Scorer(MODEL, chat=False, lora_r=LORA_R)
     if WARM:
         blob = torch.load(WARM, map_location=DEVICE)
         with torch.no_grad():
@@ -864,7 +907,7 @@ def match() -> None:
     seed = int(os.environ.get("YGO_MATCH_SEED", "4000"))
     fmt = lambda k: R3_FMT if os.environ.get(k) == "r3" else None
     t0 = time.time()
-    sc = Scorer(MODEL, chat=False, lora_r=16)
+    sc = Scorer(MODEL, chat=False, lora_r=LORA_R)
     load = lambda p: torch.load(p, map_location=DEVICE)
     states = {"ck:a": load(a_path)}
     vlog_path = os.environ.get("YGO_MATCH_VALUE_LOG", "")
@@ -878,11 +921,15 @@ def match() -> None:
         return out
     players = {"ck:a": play_a}
     me = "shadow:ck:a" if os.environ.get("YGO_MATCH_SHADOW") == "1" else "ck:a"
-    opp = b
-    if b != "windbot":
+    opp, opp_decks = b, None
+    if b == "pool":  # round 5: WindBot piloting the 5 pool decks in turn
+        opp, opp_decks = "windbot", POOL_DECKS
+    elif b != "windbot":
         opp = "ck:b"
+        b_model = os.environ.get("YGO_MATCH_B_MODEL", MODEL)  # round 5: B may be a 0.5B model when A is the 1.5B
+        sc_b = sc if b_model == MODEL else Scorer(b_model, chat=False, lora_r=16)
         states[opp] = load(b)
-        players[opp] = lambda rs: choose(sc, rs, greedy=True, state=states["ck:b"], fmt=fmt("YGO_MATCH_B_FMT"))
+        players[opp] = lambda rs: choose(sc_b, rs, greedy=True, state=states["ck:b"], fmt=fmt("YGO_MATCH_B_FMT"))
     gpu_f = DATA / "gpu_s.json"
     prev = json.loads(gpu_f.read_text())["gpu_s"] if gpu_f.exists() else 0.0
     clock = [t0]
@@ -907,6 +954,7 @@ def match() -> None:
                                             "won": int(res["winner"] == d["seat"]), "held": held_game(key)}) + "\n")
 
     gl = paired_vs(me, opp, games, seed) if os.environ.get("YGO_MATCH_PAIRED") == "1" else seats_vs(me, opp, games)
+    gl = with_decks(gl, me, opp_decks)
     res = run_match(name, gl, players, st_file, seed=seed, on_tick=tick)
     clock[0] = 0
     tick()
@@ -953,7 +1001,7 @@ def sl() -> None:
     """Round 4 re-imitation (and DAgger's aggregate SL): YGO_WARM plus supervised cross-entropy on YGO_LABELS_FILE
     (held-out games excluded), SL_EPOCHS at SL_LR. Resumable. Writes <YGO_DATA>/final.pt and result.json."""
     tick = gpu_clock()
-    sc = Scorer(MODEL, chat=False, lora_r=16)
+    sc = Scorer(MODEL, chat=False, lora_r=LORA_R)
     model = sc.model
     params = list(lora_params(model).values())
     for p in params:
@@ -969,8 +1017,9 @@ def sl() -> None:
         opt.load_state_dict(blob["opt"])
         log("resumed", step=s["step"], msg=f"resumed step={s['step']}")
     else:
-        load_lora(sc, WARM)
-        log("fresh", warm=WARM, labels=LABELS_FILE, lr=SL_LR)
+        if WARM:  # round 5: no WARM = a fresh LoRA (the 1.5B trial imitates from scratch)
+            load_lora(sc, WARM)
+        log("fresh", warm=WARM, labels=LABELS_FILE, lr=SL_LR, model=MODEL)
 
     def save_ckpt(reason: str) -> None:
         CKPT.mkdir(parents=True, exist_ok=True)
@@ -1031,7 +1080,7 @@ def values() -> None:
     for f in os.environ["YGO_VALUE_FILES"].split(","):
         with open(f) as fh:
             rows += [json.loads(l) for l in fh]
-    sc = Scorer(MODEL, chat=False, lora_r=16)
+    sc = Scorer(MODEL, chat=False, lora_r=LORA_R)
     load_lora(sc, WARM)
     sc.feature_hook()
     feat_f = DATA / "features.pt"
@@ -1095,6 +1144,154 @@ def values() -> None:
     (DATA / "done-values").write_text(out["critic"])
 
 
+def values2() -> None:
+    """Round 5 bigger critic: a value head on its own trainable LoRA trunk (initialised from YGO_WARM), trained
+    with BCE on game outcomes: up to YGO_VALUE_PER_GAME decisions of every training game in YGO_VALUE_FILES, one
+    pass (YGO_VALUE_EPOCHS), resumable. Scored on the held-out games against the LP-only predictor; the gate is
+    round 4's: critic=on iff auc >= 0.75 and brier <= 0.9 x brier_lp. Writes vtrunk.pt + vhead.pt, result.json."""
+    tick = gpu_clock()
+    per_game = int(os.environ.get("YGO_VALUE_PER_GAME", "16"))
+    by_game: dict = {}
+    for f in os.environ["YGO_VALUE_FILES"].split(","):
+        with open(f) as fh:
+            for l in fh:
+                r = json.loads(l)
+                by_game.setdefault(f"{f}|{r['seed']}", []).append(r)
+    rows = []
+    for k in sorted(by_game):
+        ds = by_game[k]
+        step = max(1, len(ds) // per_game)
+        rows += [dict(r, game=k) for r in ds[::step][:per_game]]
+    train_rows = [r for r in rows if not r["held"]]
+    held_rows = [r for r in rows if r["held"]]
+    random.Random(5).shuffle(train_rows)
+    sc = Scorer(MODEL, chat=False, lora_r=LORA_R)
+    load_lora(sc, WARM)
+    sc.feature_hook()
+    model = sc.model
+    head = ValueHead(model.config.hidden_size).to(DEVICE)
+    params = list(lora_params(model).values())
+    for p_ in params:
+        p_.requires_grad_(True)
+    opt = torch.optim.AdamW([{"params": params, "lr": float(os.environ.get("YGO_VALUE_LR", "5e-5"))},
+                             {"params": head.parameters(), "lr": 1e-3}], weight_decay=0.0)
+    st = {"pos": 0}
+    if (CKPT / "state.json").exists():
+        st = json.loads((CKPT / "state.json").read_text())
+        blob = torch.load(CKPT / "ckpt.pt", map_location=DEVICE, weights_only=False)
+        with torch.no_grad():
+            for n, p_ in lora_params(model).items():
+                p_.copy_(blob["lora"][n])
+        head.load_state_dict(blob["head"])
+        opt.load_state_dict(blob["opt"])
+        log("resumed", pos=st["pos"], msg=f"resumed pos={st['pos']}")
+    total = int(len(train_rows) * float(os.environ.get("YGO_VALUE_EPOCHS", "1")))
+
+    def save(reason: str) -> None:
+        CKPT.mkdir(parents=True, exist_ok=True)
+        torch.save({"lora": {n: p_.detach() for n, p_ in lora_params(model).items()}, "head": head.state_dict(),
+                    "opt": opt.state_dict()}, CKPT / "ckpt.tmp")
+        os.replace(CKPT / "ckpt.tmp", CKPT / "ckpt.pt")
+        save_json(CKPT / "state.json", st)
+        log("checkpoint", msg=f"checkpoint pos={st['pos']}", reason=reason)
+
+    log("values2_start", rows=len(rows), train=len(train_rows), held=len(held_rows), games=len(by_game), total=total)
+    t_save = time.time()
+    micro = MICRO
+    while st["pos"] + BATCH <= total:
+        if STOP:
+            save("stop")
+            tick(True)
+            return
+        batch = [train_rows[k % len(train_rows)] for k in range(st["pos"], st["pos"] + BATCH)]
+        model.train()
+        opt.zero_grad(set_to_none=True)
+        lt = 0.0
+        try:
+            for i in range(0, BATCH, micro):
+                mb = batch[i:i + micro]
+                fs: list = []
+                sc.logits([r["prompt"] for r in mb], [r["n"] for r in mb], grad=True, feats=fs)
+                y = torch.tensor([float(r["won"]) for r in mb], device=DEVICE)
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(head(torch.stack(fs)), y) * len(mb) / BATCH
+                loss.backward()
+                lt += loss.item()
+        except torch.OutOfMemoryError:
+            opt.zero_grad(set_to_none=True)
+            model.eval()
+            torch.cuda.empty_cache()
+            micro = max(1, micro // 2)
+            log("oom_skip", micro=micro)
+            continue
+        torch.nn.utils.clip_grad_norm_(params + list(head.parameters()), 1.0)
+        opt.step()
+        model.eval()
+        st["pos"] += BATCH
+        tick()
+        if st["pos"] % (BATCH * 50) == 0:
+            log("step", phase="values2", pos=st["pos"], of=total, loss=round(lt, 4))
+        if time.time() - t_save > SAVE_EVERY_S:
+            save("periodic")
+            t_save = time.time()
+    preds = []
+    for i in range(0, len(held_rows), 64):
+        if STOP:
+            save("stop")
+            tick(True)
+            return
+        part = held_rows[i:i + 64]
+        fs = []
+        with torch.no_grad():
+            sc.logits([r["prompt"] for r in part], [r["n"] for r in part], feats=fs)
+            preds += torch.sigmoid(head(torch.stack(fs))).tolist()
+        tick()
+    y_tr = torch.tensor([float(r["won"]) for r in train_rows], device=DEVICE)
+    phi_tr = torch.tensor([lp_phi(r["prompt"]) for r in train_rows], device=DEVICE)
+    w = torch.zeros(2, device=DEVICE, requires_grad=True)  # the LP-only predictor, fit on the same training games
+    lopt = torch.optim.Adam([w], lr=0.05)
+    for _ in range(2000):
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(w[0] * phi_tr + w[1], y_tr)
+        lopt.zero_grad()
+        loss.backward()
+        lopt.step()
+    y = [int(r["won"]) for r in held_rows]
+    with torch.no_grad():
+        p_lp = torch.sigmoid(w[0] * torch.tensor([lp_phi(r["prompt"]) for r in held_rows], device=DEVICE) + w[1]).tolist()
+    brier = sum((p - t) ** 2 for p, t in zip(preds, y)) / len(y)
+    brier_lp = sum((p - t) ** 2 for p, t in zip(p_lp, y)) / len(y)
+    a, a_lp = auc(preds, y), auc(p_lp, y)
+    on = a >= 0.75 and brier <= 0.9 * brier_lp
+    torch.save({n: p_.detach().clone() for n, p_ in lora_params(model).items()}, DATA / "vtrunk.pt")
+    torch.save(head.state_dict(), DATA / "vhead.pt")
+    gpu_s = tick(True)
+    games = len(by_game)
+    held_games = len({r["game"] for r in held_rows})
+    out = {"warm": WARM, "auc": round(a, 4), "brier": round(brier, 4), "brier_lp": round(brier_lp, 4), "auc_lp": round(a_lp, 4),
+           "games": games, "held_games": held_games, "decisions": len(rows), "held_decisions": len(held_rows),
+           "critic": "on" if on else "off", "gpu_s": round(gpu_s, 1)}
+    save_json(DATA / "result.json", out)
+    log("values", msg=f"value auc={a:.4f} brier={brier:.4f} brier_lp={brier_lp:.4f} games={games} "
+                      f"(held-out {held_games} games, {len(held_rows)} decisions; auc_lp={a_lp:.4f})")
+    (DATA / "done-values2").write_text(out["critic"])
+
+
+CA_K = float(os.environ.get("YGO_CA_K", "0.02"))
+
+
+def ca_phi(counts) -> float:
+    """Round 5 card-advantage potential (the round-5 research formula) from the runner's public counts
+    [my hand, monsters, spells/traps, GY, banished, opp hand, opp face-up monsters, opp face-down cards, opp GY,
+    opp banished]: A_me = H + M + 0.75 ST + 0.1 min(GY, 10), A_opp = H + M_up + 0.85 FD + 0.1 min(GY, 10),
+    phi = CA_K x clip(A_me - A_opp, -8, 8). Ng's shaping uses phi(s') - phi(s), with phi = 0 at the game's end.
+    (The research formula's LP term is left out: recipe 4's LP potential is kept as it was.)"""
+    if not counts:
+        return 0.0
+    c = counts
+    a_me = c[0] + c[1] + 0.75 * c[2] + 0.1 * min(c[3], 10)
+    a_opp = c[5] + c[6] + 0.85 * c[7] + 0.1 * min(c[8], 10)
+    return CA_K * max(-8.0, min(8.0, a_me - a_opp))
+
+
 def practice() -> None:
     """Round 4 practice (recipe 4) from YGO_WARM, vs 0.6 WindBot / 0.2 pool / 0.2 itself, sampling at temperature 1.
     Fresh on-policy buffer: collect COLLECT finished decisions, update (<= 2 epochs, minibatch 256 as micro-batch
@@ -1103,15 +1300,23 @@ def practice() -> None:
     Critic on (YGO_VHEAD): GAE gamma=1 lambda=0.95 on V = 2 P(win) - 1, the head trained online on detached
     features; off: the running baseline. A 300-game greedy WindBot eval every 3 GPU-h and at the cap.
     Stops: cap (YGO_CAP_H); regress (two evals in a row > 0.05 below YGO_START_WR); unstable (mean clipfrac of an
-    update > 0.30 after one lr halving). done-practice holds the best checkpoint among the start and the evals."""
+    update > 0.30 after one lr halving). done-practice holds the best checkpoint among the start and the evals.
+    Round 5 (YGO_R5=1): the learner plays MY_DECK, WindBot games spread over POOL_DECKS; reward win =
+    max(0.85, 1 - 0.01 x turns past 5) (fast-win), loss/draw -1; plus the card-advantage potential ca_phi (Ng, with
+    phi(terminal) = 0, so it can't change the best policy); optionally (YGO_RESPONSE_BONUS=1) +0.02 per own
+    activation at chain link 2+ on top of an opponent's link, capped at 0.1 a game; an entropy bonus whose
+    coefficient rises while the mean policy entropy is under YGO_ENT_FLOOR. Evals print the entropy too."""
     LR, EPOCHS, KL_STOP, PHI_K, LAM = 1e-5, 2, 0.02, 0.25, 0.95
+    R5 = os.environ.get("YGO_R5") == "1"
+    RESP = os.environ.get("YGO_RESPONSE_BONUS") == "1"
+    ENT_FLOOR = float(os.environ.get("YGO_ENT_FLOOR", "0"))
     COLLECT, MINI = int(os.environ.get("YGO_COLLECT", "2048")), int(os.environ.get("YGO_MINI", "256"))  # smaller: pause test only
     shares = {"windbot": 0.6, "pool": 0.2, "learner": 0.2}
     cap_h = float(os.environ.get("YGO_CAP_H", "10"))
     start_wr = float(os.environ["YGO_START_WR"])
     eval_every_h = float(os.environ.get("YGO_EVAL_EVERY_H", "3"))
     vhead_path = os.environ.get("YGO_VHEAD", "")
-    sc = Scorer(MODEL, chat=False, lora_r=16)
+    sc = Scorer(MODEL, chat=False, lora_r=LORA_R)
     model = sc.model
     sc.feature_hook()
     params = list(lora_params(model).values())
@@ -1119,13 +1324,17 @@ def practice() -> None:
         p_.requires_grad_(True)
     opt = torch.optim.AdamW(params, lr=LR, weight_decay=0.0)
     head = None
+    vtrunk = None
     if vhead_path:
-        head = ValueHead(896).to(DEVICE)
+        head = ValueHead(model.config.hidden_size).to(DEVICE)
         head.load_state_dict(torch.load(vhead_path, map_location=DEVICE))
         vopt = torch.optim.Adam(head.parameters(), lr=3e-4)
+        if os.environ.get("YGO_VTRUNK"):  # round 5: the critic's own LoRA trunk, kept frozen during practice
+            vtrunk = torch.load(os.environ["YGO_VTRUNK"], map_location=DEVICE)
     s = {"step": 0, "gpu_s": 0.0, "evals": [], "pool": [], "games": 0, "errors": 0, "jobs": [], "seed": 40_000,
          "decisions": 0, "lr": LR, "lr_halved": False, "ret_mean": 0.0, "ret_var": 1.0, "clip_since_eval": [],
-         "last_eval_gpu_s": 0.0, "critic": head is not None}
+         "last_eval_gpu_s": 0.0, "critic": head is not None, "ent_coef": 0.01, "ent_since_eval": [], "r5": R5,
+         "response_bonus": RESP, "ent_floor": ENT_FLOOR}
     traj: dict[str, list] = {}
     buffer: list[dict] = []
     if (CKPT / "state.json").exists():
@@ -1143,7 +1352,10 @@ def practice() -> None:
         log("resumed", step=s["step"], msg=f"resumed step={s['step']}", gpu_h=round(s["gpu_s"] / 3600, 3))
     else:
         load_lora(sc, WARM)
-        log("fresh", warm=WARM, critic=head is not None, cap_h=cap_h, start_wr=start_wr)
+        random.seed(int(os.environ.get("YGO_PRACTICE_SEED", "0")) or None)  # round 5: matched trial slices
+        torch.manual_seed(int(os.environ.get("YGO_PRACTICE_SEED", "0")) or 1)
+        log("fresh", warm=WARM, critic=head is not None, vtrunk=vtrunk is not None, cap_h=cap_h, start_wr=start_wr,
+            r5=R5, response_bonus=RESP, ent_floor=ENT_FLOOR, deck=MY_DECK, model=MODEL)
     for g in opt.param_groups:
         g["lr"] = s["lr"]
     pool = {p_["name"]: torch.load(CKPT / "pool" / f"{p_['name']}.pt", map_location=DEVICE) for p_ in s["pool"][-POOL:]}
@@ -1186,7 +1398,12 @@ def practice() -> None:
             fs: list = []
             with torch.no_grad():
                 lg = sc.logits([r["prompt"] for r in rs], [r["n"] for r in rs], feats=fs)
-                vs = torch.sigmoid(head(torch.stack(fs))).tolist() if head is not None and state is None and not greedy else [None] * len(rs)
+                vs = [None] * len(rs)
+                if head is not None and state is None and not greedy:
+                    if vtrunk is not None:
+                        with Weights(model, vtrunk):
+                            sc.logits([r["prompt"] for r in rs], [r["n"] for r in rs], feats=fs)
+                    vs = torch.sigmoid(head(torch.stack(fs))).tolist()
         out = []
         for l, v in zip(lg, vs):
             lp = torch.log_softmax(l, -1)
@@ -1209,13 +1426,18 @@ def practice() -> None:
         cf = s["clip_since_eval"]
         clipfrac = round(sum(cf) / len(cf), 4) if cf else 0.0
         s["clip_since_eval"] = []
+        es = s.get("ent_since_eval", [])
+        entropy = round(sum(es) / len(es), 4) if es else 0.0
+        s["ent_since_eval"] = []
         snap = snapshot()
         gpu_h = round(s["gpu_s"] / 3600, 2)
         s["evals"].append({"step": s["step"], "gpu_h": gpu_h, "vs_windbot": res["win_rate"], "games": res["games"],
-                           "errors": res["errors"], "clipfrac": clipfrac, "ckpt": snap, "replays": res["replays"]})
+                           "errors": res["errors"], "clipfrac": clipfrac, "entropy": entropy, "ckpt": snap,
+                           "replays": res["replays"], "mean_turns": res.get("mean_turns")})
         s["last_eval_gpu_s"] = s["gpu_s"]
         log("eval", step=s["step"], gpu_h=gpu_h, vs_windbot=res["win_rate"], games=res["games"], errors=res["errors"],
-            clipfrac=clipfrac, msg=f"eval step={s['step']} gpu_h={gpu_h} vs_windbot={res['win_rate']:.3f} games={res['games']} clipfrac={clipfrac}")
+            clipfrac=clipfrac, entropy=entropy,
+            msg=f"eval step={s['step']} gpu_h={gpu_h} vs_windbot={res['win_rate']:.3f} games={res['games']} entropy={entropy} clipfrac={clipfrac}")
         save_ckpt("eval")
         return res["win_rate"]
 
@@ -1234,11 +1456,19 @@ def practice() -> None:
                 continue
             won = res["winner"] == seat
             R = 1.0 if won else -1.0  # a draw counts as a loss
+            if R5 and won:  # fast-win bonus: a loss (-1, at most -0.9 with responses) never beats a win (>= 0.85)
+                R = max(0.85, 1.0 - 0.01 * max(0, res.get("turns", 0) - 5))
             phi_end = (res["lp"][seat] - res["lp"][1 - seat]) / 8000
             looped = {t for st_, t in res.get("loop_turns", []) if st_ == seat}
             phis = [d["phi"] for d in ds] + [phi_end]
             rew = [PHI_K * (phis[t + 1] - phis[t]) - (LOOP_PENALTY if ds[t].get("turn") in looped else 0.0) for t in range(len(ds))]
+            if R5:  # card-advantage potential, phi(terminal) = 0
+                cas = [ca_phi(d.get("counts")) for d in ds] + [0.0]
+                for t in range(len(ds)):
+                    rew[t] += cas[t + 1] - cas[t]
             rew[-1] += R
+            if R5 and RESP:
+                rew[-1] += min(0.1, 0.02 * res.get("responses", [0, 0])[seat])
             if head is not None:  # GAE, gamma 1
                 V = [2 * d["v"] - 1 for d in ds] + [0.0]
                 adv, run = [0.0] * len(ds), 0.0
@@ -1269,7 +1499,7 @@ def practice() -> None:
                 mb = buffer[k:k + MINI]
                 model.train()
                 opt.zero_grad(set_to_none=True)
-                if head is not None:
+                if head is not None and vtrunk is None:
                     vopt.zero_grad(set_to_none=True)
                 kl = cf = ent = vl = 0.0
                 micro = s.get("micro", MICRO)
@@ -1288,8 +1518,8 @@ def practice() -> None:
                             a_ = (d["adv"] - mu) / sd
                             pg = -torch.min(ratio * a_, torch.clamp(ratio, 0.8, 1.2) * a_)
                             e = -(lp.exp() * lp).sum()
-                            loss = loss + (pg - 0.01 * e) / MINI
-                            if head is not None:
+                            loss = loss + (pg - s.get("ent_coef", 0.01) * e) / MINI
+                            if head is not None and vtrunk is None:
                                 v = head(f.detach())
                                 vloss = torch.nn.functional.binary_cross_entropy_with_logits(v, torch.tensor(d["won"], device=DEVICE))
                                 loss = loss + vloss / MINI
@@ -1317,7 +1547,7 @@ def practice() -> None:
                     break
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 opt.step()
-                if head is not None:
+                if head is not None and vtrunk is None:
                     vopt.step()
                 s["step"] += 1
                 stats["minibatches"] += 1
@@ -1340,7 +1570,13 @@ def practice() -> None:
             u = random.random()
             opp = "windbot" if u < shares["windbot"] else ("pool:" + random.choice(list(pool))) if u < shares["windbot"] + shares["pool"] else "learner"
             seats = ["learner", opp] if random.random() < 0.5 else [opp, "learner"]
-            games.append({"seats": seats, "replay": random.random() < 0.002, "live": not games})
+            g = {"seats": seats, "replay": random.random() < 0.002, "live": not games}
+            if R5:  # the learner and its own copies play MY_DECK; WindBot plays a pool deck
+                me = seats.index("learner")
+                g["decks"] = [MY_DECK or None, MY_DECK or None]
+                if opp == "windbot":
+                    g["decks"][1 - me] = random.choice(POOL_DECKS)
+            games.append(g)
         s["seed"] += 1
         job = server_call("/job", {"name": f"practice-step{s['step']}", "seed": s["seed"], "games": games})["job"]
         s["jobs"] = (s["jobs"] + [job])[-200:]
@@ -1383,7 +1619,7 @@ def practice() -> None:
                     if tag == "learner":
                         traj.setdefault(f"{r['job']}:{r['idx']}:{r['seat']}", []).append(
                             {"prompt": r["prompt"], "n": r["n"], "a": a, "logp": lp, "v": v,
-                             "phi": (r["lp"][0] - r["lp"][1]) / 8000, "turn": r.get("turn")})
+                             "phi": (r["lp"][0] - r["lp"][1]) / 8000, "turn": r.get("turn"), "counts": r.get("counts")})
                         s["decisions"] += 1
             if answers:
                 server_call("/answer", answers)
@@ -1393,6 +1629,12 @@ def practice() -> None:
             if len(buffer) >= COLLECT and not STOP:
                 stats = update()
                 s["clip_since_eval"].append(stats["clipfrac"])
+                s.setdefault("ent_since_eval", []).append(stats["ent"])
+                if ENT_FLOOR and stats["minibatches"]:  # exploration: keep the policy's entropy above the floor
+                    c = s.get("ent_coef", 0.01)
+                    c = min(0.2, c * 1.5) if stats["ent"] < ENT_FLOOR else max(0.01, c / 1.5) if stats["ent"] > 2 * ENT_FLOOR else c
+                    s["ent_coef"] = round(c, 5)
+                    stats["ent_coef"] = s["ent_coef"]
                 log("update", step=s["step"], gpu_h=round(s["gpu_s"] / 3600, 3), games=s["games"], **stats)
                 if stats["clipfrac"] > 0.30:
                     if s["lr_halved"]:
@@ -1548,4 +1790,4 @@ if __name__ == "__main__":
     if DEVICE == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
     {"train": train, "zeroshot": zeroshot, "table": table, "textcheck": textcheck, "match": match, "sl": sl,
-     "values": values, "practice": practice}[MODE]()
+     "values": values, "values2": values2, "practice": practice}[MODE]()

@@ -15,7 +15,7 @@ mod history;
 mod rng;
 mod windbot;
 
-use duel::{Agent, Ctx, Outcome, RandomAgent};
+use duel::{Agent, Ctx, GameResult, Outcome, RandomAgent};
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -148,8 +148,8 @@ fn main() {
     let replay_dir = PathBuf::from(flag("--replay-dir").unwrap_or("/srv/ygo/replays".into()));
     let fixed = flag("--fixed").unwrap_or_default(); // test only: first | last | mixed
     let replays: u32 = flag("--replays").map(|g| g.parse().expect("--replays")).unwrap_or(0);
-    if !["random", "prompt", "serve", "optcheck", "leakcheck"].contains(&mode.as_str()) {
-        eprintln!("usage: ygo-runner random|prompt|serve|optcheck|leakcheck [--games N] [--seed S] [--listen ADDR]");
+    if !["random", "prompt", "serve", "optcheck", "leakcheck", "ceiling"].contains(&mode.as_str()) {
+        eprintln!("usage: ygo-runner random|prompt|serve|optcheck|leakcheck|ceiling [--games N] [--seed S] [--listen ADDR]");
         std::process::exit(2);
     }
 
@@ -255,6 +255,74 @@ fn main() {
         }
         eprintln!("no decision with 3+ options on turn {turn}+ in 50 games");
         std::process::exit(1);
+    }
+
+    if mode == "ceiling" {
+        // Round 5 deck ceiling: WindBot pilots --deck-name against WindBot piloting each --pool deck in turn, half
+        // the games going first; draws and errors count as non-wins. No worker, no broker: CPU only.
+        let name = flag("--deck-name").expect("--deck-name");
+        let pool: Vec<String> = flag("--pool").expect("--pool").split(',').map(String::from).collect();
+        let threads: usize = flag("--threads").map(|t| t.parse().expect("--threads")).unwrap_or(3);
+        let server = std::env::var("YGO_WINDBOT").unwrap_or("127.0.0.1:2399".into());
+        let lib = Arc::new(lib);
+        let cache = std::sync::Mutex::new(std::collections::HashMap::new());
+        let mine = broker::named_deck(&lib, &cache, &name).unwrap_or_else(|e| panic!("{e}"));
+        let opps: Vec<_> = pool.iter().map(|p| broker::named_deck(&lib, &cache, p).unwrap_or_else(|e| panic!("{e}"))).collect();
+        let next = std::sync::atomic::AtomicU32::new(0);
+        let results = std::sync::Mutex::new(Vec::new());
+        let log = std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&log_path).expect("log file"));
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                sc.spawn(|| loop {
+                    let g = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if g >= games {
+                        break;
+                    }
+                    let k = (g as usize / 2) % pool.len(); // both seat orders against each pool deck
+                    let me = (g % 2) as usize;
+                    let gs = seed.wrapping_mul(1_000_003).wrapping_add(g as u64);
+                    let res = catch_unwind(AssertUnwindSafe(|| -> Result<GameResult, String> {
+                        let names = if me == 0 { [name.as_str(), pool[k].as_str()] } else { [pool[k].as_str(), name.as_str()] };
+                        let w0 = windbot::WindBot::connect(&server, names[0], 0, "WindBot")?;
+                        let w1 = windbot::WindBot::connect(&server, names[1], 1, "WindBot")?;
+                        let (mut a0, mut a1) = (duel::WindBotAgent(w0, false), duel::WindBotAgent(w1, false));
+                        let decks = if me == 0 { [&*mine, &*opps[k]] } else { [&*opps[k], &*mine] };
+                        duel::play2(&lib, decks, gs, &mut [&mut a0, &mut a1], false, None)
+                    }));
+                    let res = match res {
+                        Ok(r) => r,
+                        Err(p) => Err(format!("panic: {}", p.downcast_ref::<String>().cloned().or(p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default())),
+                    };
+                    let line = match &res {
+                        Ok(r) => {
+                            let won = matches!(r.outcome, Outcome::Win { player, .. } if player as usize == me);
+                            serde_json::json!({"game": g, "seed": gs, "deck": name, "opp": pool[k], "seat": me, "won": won,
+                                "turns": r.turns, "draw": matches!(r.outcome, Outcome::Draw { .. })})
+                        }
+                        Err(e) => serde_json::json!({"game": g, "seed": gs, "deck": name, "opp": pool[k], "seat": me, "error": e}),
+                    };
+                    writeln!(log.lock().unwrap(), "{line}").unwrap();
+                    results.lock().unwrap().push(line);
+                });
+            }
+        });
+        let rs = results.into_inner().unwrap();
+        let n = rs.len() as f64;
+        let wins = rs.iter().filter(|r| r["won"].as_bool() == Some(true)).count() as f64;
+        let errors = rs.iter().filter(|r| r.get("error").is_some()).count();
+        let draws = rs.iter().filter(|r| r["draw"].as_bool() == Some(true)).count();
+        let (z, p) = (1.96f64, wins / n.max(1.0));
+        let d = 1.0 + z * z / n;
+        let c = (p + z * z / (2.0 * n)) / d;
+        let h = z * (p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt() / d;
+        let by: Vec<String> = pool.iter().map(|o| {
+            let m: Vec<_> = rs.iter().filter(|r| r["opp"] == o.as_str()).collect();
+            format!("{o}:{:.2}", m.iter().filter(|r| r["won"].as_bool() == Some(true)).count() as f64 / m.len().max(1) as f64)
+        }).collect();
+        let mean_turns = rs.iter().filter_map(|r| r["turns"].as_u64()).sum::<u64>() as f64 / (n - errors as f64).max(1.0);
+        println!("ceiling deck={name} windbot_wr={p:.3} ci95=[{:.3},{:.3}] games={} errors={errors} draws={draws} turns={mean_turns:.1} by_opp={}",
+            c - h, c + h, rs.len(), by.join(","));
+        return;
     }
 
     if mode == "serve" {

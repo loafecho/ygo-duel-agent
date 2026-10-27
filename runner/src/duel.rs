@@ -1,5 +1,5 @@
 //! One duel on the engine: create, load decks, step messages, hand each decision to an agent.
-use crate::board::{self, Board};
+use crate::board::{self, Board, CardView};
 use crate::data::{self, Library};
 use crate::decide::{self, Decision, Reader};
 use crate::history::{self, History};
@@ -38,6 +38,27 @@ pub struct Ctx<'a> {
     pub revealed: &'a [u32],
     /// With TRACE_PUBLIC on: every code seen face-up (field, GY, face-up banished) after any engine message batch.
     pub seen_public: &'a [u32],
+    /// Round 5 card-advantage potential: public counts. Mine: hand, monsters, spells/traps, GY, banished.
+    /// The opponent's: hand, face-up monsters, face-down cards (monsters and spells/traps), GY, banished.
+    pub counts: [u32; 10],
+}
+
+/// Round 5: the public card counts of `me` and the opponent (see Ctx::counts).
+pub fn counts(b: &Board, me: u8) -> [u32; 10] {
+    let mut out = [0u32; 10];
+    let (mine, opp) = (&b.sides[(me & 1) as usize], &b.sides[(1 - (me & 1)) as usize]);
+    let up = |c: &&CardView| c.pos & 0x5 != 0;
+    out[0] = mine.hand.len() as u32;
+    out[1] = mine.mzone.iter().flatten().count() as u32;
+    out[2] = mine.szone.iter().flatten().count() as u32;
+    out[3] = mine.grave.len() as u32;
+    out[4] = mine.banished.len() as u32;
+    out[5] = opp.hand.len() as u32;
+    out[6] = opp.mzone.iter().flatten().filter(up).count() as u32;
+    out[7] = opp.mzone.iter().flatten().chain(opp.szone.iter().flatten()).filter(|c| !up(c)).count() as u32;
+    out[8] = opp.grave.len() as u32;
+    out[9] = opp.banished.len() as u32;
+    out
 }
 
 /// Leak check only: sample the full board after every engine message batch (slow).
@@ -144,6 +165,8 @@ pub struct GameResult {
     pub loop_turns: Vec<[u32; 2]>,
     /// Shadow seats, per seat: [decisions asked, advice among the options, the seat chose otherwise].
     pub shadow: [[u32; 3]; 2],
+    /// Round 5 response bonus, per seat: own activations at chain link 2+ directly on top of an opponent's link.
+    pub responses: [u32; 2],
     /// One entry per decision when recording: options, the choice made, and the board when it changed.
     pub steps: Vec<Value>,
     pub names: BTreeMap<u32, String>,
@@ -235,7 +258,9 @@ pub fn play2(
     let mut rejected: Vec<Vec<u8>> = Vec::new(); // answers the engine refused for the message being re-asked
     let mut last_resp: Vec<u8> = Vec::new();
     let mut shadow = [[0u32; 3]; 2];
-    let finish = |outcome, view: &View, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns, shadow| GameResult {
+    let mut responses = [0u32; 2];
+    let mut chain_top: Option<u8> = None; // who activated the newest chain link
+    let finish = |outcome, view: &View, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns, shadow, responses| GameResult {
         outcome,
         turns: view.turn,
         decisions,
@@ -248,6 +273,7 @@ pub fn play2(
         loop_breaks,
         loop_turns,
         shadow,
+        responses,
     };
     loop {
         let status = unsafe { OCG_DuelProcess(duel.0) };
@@ -283,6 +309,12 @@ pub fn play2(
                 }
             }
             if let Some(e) = history::event(msg, view.turn, &|c, l, q| board::card_at(duel.0, c, l, q)) {
+                if e.verb == "activated" {
+                    if e.chain >= 2 && chain_top.is_some_and(|p| p != e.actor) {
+                        responses[e.actor as usize] += 1;
+                    }
+                    chain_top = Some(e.actor);
+                }
                 hist.push(e);
             }
             let mut r = Reader::new(&msg[1..]);
@@ -300,13 +332,13 @@ pub fn play2(
                         let b = Board::read(duel.0, view.turn, view.turn_player, view.phase, view.lp)?;
                         steps.push(json!({"i": decisions, "end": true, "winner": if p > 1 { -1 } else { p as i32 }, "board": b.to_json(lib, &mut names)}));
                     }
-                    return Ok(finish(outcome, &view, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns, shadow));
+                    return Ok(finish(outcome, &view, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns, shadow, responses));
                 }
                 decide::MSG_NEW_TURN => {
                     view.turn += 1;
                     view.turn_player = r.u8()?;
                     if view.turn > TURN_LIMIT {
-                        return Ok(finish(Outcome::Draw { reason: "turn limit" }, &view, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns, shadow));
+                        return Ok(finish(Outcome::Draw { reason: "turn limit" }, &view, decisions, retries, max_choices, steps, names, loop_breaks, loop_turns, shadow, responses));
                     }
                 }
                 decide::MSG_NEW_PHASE => view.phase = r.u16()?,
@@ -445,7 +477,8 @@ pub fn play2(
         } else if looping {
             rng.below(d.choices.len())
         } else {
-            agents[who].choose(&d, &Ctx { view: &view, prompt: prompt.as_deref(), board: board.as_ref(), revealed: &revealed, seen_public: &seen_public }, &mut rng)?
+            agents[who].choose(&d, &Ctx { view: &view, prompt: prompt.as_deref(), board: board.as_ref(), revealed: &revealed, seen_public: &seen_public,
+                counts: board.as_ref().map(|b| counts(b, d.player)).unwrap_or_default() }, &mut rng)?
         };
         if d.choices.len() > 1 && !looping && !rejected_now {
             if let Some(w) = agents[who].shadow() {

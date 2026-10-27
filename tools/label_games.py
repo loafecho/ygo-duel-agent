@@ -11,6 +11,10 @@ import argparse, json, time, urllib.request
 ap = argparse.ArgumentParser()
 ap.add_argument("--server", default="http://198.51.100.10:8766")
 ap.add_argument("--games", type=int, default=200)
+# round 5: the labelled seat plays --deck (a WindBot deck name); its opponent is a plain WindBot playing --opp-decks in
+# turn (both seat orders each); without them, round 4's Cyber Dragon mirror with both seats labelled
+ap.add_argument("--deck", default="")
+ap.add_argument("--opp-decks", default="")
 a = ap.parse_args()
 
 
@@ -20,7 +24,15 @@ def call(path, body=None, timeout=60):
     return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
 
 
-games = [{"seats": ["windbot-labels", "windbot-labels"]} for _ in range(a.games)]
+if a.deck or a.opp_decks:
+    opps = [d or None for d in a.opp_decks.split(",")] if a.opp_decks else [a.deck or None]
+    games = []
+    for g in range(a.games):
+        o = opps[(g // 2) % len(opps)]
+        games.append({"seats": ["windbot-labels", "windbot"] if g % 2 == 0 else ["windbot", "windbot-labels"],
+                      "decks": [a.deck or None, o] if g % 2 == 0 else [o, a.deck or None]})
+else:
+    games = [{"seats": ["windbot-labels", "windbot-labels"]} for _ in range(a.games)]
 job = call("/job", {"name": "windbot-labels", "seed": int(time.time()), "games": games})["job"]
 print(json.dumps({"event": "job", "job": job, "games": a.games}), flush=True)
 results, t0 = [], time.time()

@@ -1,6 +1,9 @@
 //! Game server on the game host. The GPU worker connects OUT to it; nothing on the GPU workstation listens.
 //!   POST /job     {"name", "seed", "games": [{"seats": ["learner", "random"], "replay": false}, ...]} -> {"job": id}
 //!                 A seat is "random" (played here) or any other policy tag, answered by the worker.
+//!                 Round 5: a game may carry "decks": [d0, d1], WindBot deck names (AI_<d>.ydk in YGO_DECK_DIR,
+//!                 default /srv/ygo/windbot/Decks); null or no "decks" is the server's --deck. WindBot seats play
+//!                 their seat's deck.
 //!   GET  /next?max=N&wait=S&gather=MS   long-poll (default 25 s); once a decision is waiting it keeps
 //!                      gathering for up to MS ms (default 0) or until every running game is waiting: {"requests": [{"id","job","idx","seat","policy","lp","prompt","n"}],
 //!                      "results": [finished games]}; results are handed out once
@@ -31,6 +34,7 @@ pub struct GameSpec {
     pub replay: bool,
     pub live: bool,
     pub name: String,
+    pub decks: [Option<String>; 2],
 }
 
 struct Pending {
@@ -159,17 +163,24 @@ impl Broker {
         for (i, g) in games.iter().enumerate() {
             let seats = g["seats"].as_array().ok_or("need seats")?;
             let seat = |k: usize| seats.get(k).and_then(|s| s.as_str()).map(String::from).ok_or("seat must be a string");
+            let deck = |k: usize| -> Result<Option<String>, String> {
+                match g["decks"].get(k) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(d)) if !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || "-_[]".contains(c)) => Ok(Some(d.clone())),
+                    Some(d) => Err(format!("bad deck name {d}")),
+                }
+            };
             specs.push((i as u32, [seat(0)?, seat(1)?], g["replay"].as_bool().unwrap_or(false), g["live"].as_bool().unwrap_or(false),
-                g["seed"].as_u64()));
+                g["seed"].as_u64(), [deck(0)?, deck(1)?]));
         }
         let (m, cv) = &*self.0;
         let mut st = m.lock().unwrap();
         st.next_job += 1;
         let job = st.next_job;
-        for (idx, seats, replay, live, own_seed) in specs {
+        for (idx, seats, replay, live, own_seed, decks) in specs {
             // round 4: a game may carry its own seed (paired games: the same deal with the seats swapped)
             let seed = own_seed.unwrap_or(seed.wrapping_mul(1_000_003).wrapping_add(job << 32).wrapping_add(idx as u64));
-            st.queue.push_back(GameSpec { job, idx, seed, seats, replay, live, name: name.clone() });
+            st.queue.push_back(GameSpec { job, idx, seed, seats, replay, live, name: name.clone(), decks });
             *st.active.entry(job).or_insert(0) += 1;
         }
         cv.notify_all();
@@ -311,7 +322,8 @@ impl Agent for RemoteAgent<'_> {
         let prompt = ctx.prompt.ok_or("remote seat without a prompt")?;
         self.requests += 1;
         let c = self.broker.ask(json!({"job": self.job, "idx": self.idx, "seat": self.seat, "policy": self.policy,
-            "lp": [ctx.view.lp[me], ctx.view.lp[1 - me]], "turn": ctx.view.turn, "prompt": prompt, "n": d.choices.len()}));
+            "lp": [ctx.view.lp[me], ctx.view.lp[1 - me]], "turn": ctx.view.turn, "prompt": prompt, "n": d.choices.len(),
+            "counts": ctx.counts}));
         if c >= d.choices.len() {
             return Err(format!("worker answered {c} for {} options", d.choices.len()));
         }
@@ -334,22 +346,54 @@ impl Agent for ShadowAgent<'_> {
     }
 }
 
+/// Round 5: a WindBot deck by name (AI_<name>.ydk in YGO_DECK_DIR), checked for card data and scripts; cached.
+pub fn named_deck(lib: &Library, cache: &Mutex<HashMap<String, Arc<duel::Deck>>>, name: &str) -> Result<Arc<duel::Deck>, String> {
+    if let Some(d) = cache.lock().unwrap().get(name) {
+        return Ok(d.clone());
+    }
+    let dir = std::env::var("YGO_DECK_DIR").unwrap_or("/srv/ygo/windbot/Decks".into());
+    let d = crate::data::read_ydk(&PathBuf::from(dir).join(format!("AI_{name}.ydk")))?;
+    let missing: Vec<u32> = d.0.iter().chain(&d.1).copied()
+        .filter(|c| !lib.cards.contains_key(c) || !lib.has_script(&format!("c{c}.lua"))).collect();
+    if d.0.is_empty() || !missing.is_empty() {
+        return Err(format!("deck {name}: {} main cards, missing data/script {missing:?}", d.0.len()));
+    }
+    let d = Arc::new(d);
+    cache.lock().unwrap().insert(name.to_string(), d.clone());
+    Ok(d)
+}
+
 /// Game threads: each takes the next queued game, plays it, and posts the result.
 pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32>)>, threads: usize, replay_dir: PathBuf) {
     let _ = std::fs::create_dir_all(&replay_dir);
+    let cache: Arc<Mutex<HashMap<String, Arc<duel::Deck>>>> = Arc::new(Mutex::new(HashMap::new()));
     for _ in 0..threads {
-        let (b, lib, deck, dir) = (broker.clone(), lib.clone(), deck.clone(), replay_dir.clone());
+        let (b, lib, deck, dir, cache) = (broker.clone(), lib.clone(), deck.clone(), replay_dir.clone(), cache.clone());
         std::thread::spawn(move || loop {
             let g = b.take_game();
             let started = Instant::now();
-            let mut agents: Vec<Box<dyn Agent + '_>> = Vec::new();
             let mut seat_error: Option<String> = None;
+            let mut seat_decks: Vec<Arc<duel::Deck>> = Vec::new();
+            for k in 0..2 {
+                match &g.decks[k] {
+                    None => seat_decks.push(deck.clone()),
+                    Some(n) => match named_deck(&lib, &cache, n) {
+                        Ok(d) => seat_decks.push(d),
+                        Err(e) => {
+                            seat_error = Some(e);
+                            seat_decks.push(deck.clone());
+                        }
+                    },
+                }
+            }
+            let wb_deck = |k: usize| g.decks[k].clone().unwrap_or("CyberDragon".into());
+            let mut agents: Vec<Box<dyn Agent + '_>> = Vec::new();
             for (k, pol) in g.seats.iter().enumerate() {
                 if pol == "random" {
                     agents.push(Box::new(RandomAgent));
                 } else if pol == "windbot" || pol == "windbot-labels" {
                     let server = std::env::var("YGO_WINDBOT").unwrap_or("127.0.0.1:2399".into());
-                    match crate::windbot::WindBot::connect(&server, "CyberDragon", k as u8, "WindBot") {
+                    match crate::windbot::WindBot::connect(&server, &wb_deck(k), k as u8, "WindBot") {
                         Ok(w) => agents.push(Box::new(WindBotAgent(w, pol == "windbot-labels"))),
                         Err(e) => {
                             seat_error = Some(e);
@@ -359,7 +403,7 @@ pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32
                 } else if let Some(inner) = pol.strip_prefix("shadow:") {
                     let server = std::env::var("YGO_WINDBOT").unwrap_or("127.0.0.1:2399".into());
                     let remote = RemoteAgent { broker: &b, job: g.job, idx: g.idx, seat: k as u8, policy: inner.to_string(), requests: 0 };
-                    match crate::windbot::WindBot::connect(&server, "CyberDragon", k as u8, "Shadow") {
+                    match crate::windbot::WindBot::connect(&server, &wb_deck(k), k as u8, "Shadow") {
                         Ok(w) => agents.push(Box::new(ShadowAgent(remote, w))),
                         Err(e) => {
                             seat_error = Some(e);
@@ -381,7 +425,7 @@ pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32
             let live: Option<&dyn Fn(Value)> = if g.live { Some(&publish) } else { None };
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &seat_error {
                 Some(e) => Err(e.clone()),
-                None => duel::play(&lib, &deck, g.seed, &mut [a0[0].as_mut(), rest[0].as_mut()], g.replay, live),
+                None => duel::play2(&lib, [&seat_decks[0], &seat_decks[1]], g.seed, &mut [a0[0].as_mut(), rest[0].as_mut()], g.replay, live),
             }));
             let res = match res {
                 Ok(r) => r,
@@ -392,6 +436,9 @@ pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32
             };
             let mut out = json!({"job": g.job, "idx": g.idx, "name": g.name, "seed": g.seed, "seats": g.seats,
                 "seconds": started.elapsed().as_secs_f64()});
+            if g.decks.iter().any(|d| d.is_some()) {
+                out["decks"] = json!(g.decks);
+            }
             let error = res.is_err();
             match res {
                 Ok(r) => {
@@ -408,12 +455,13 @@ pub fn run_games(broker: Broker, lib: Arc<Library>, deck: Arc<(Vec<u32>, Vec<u32
                     out["max_choices"] = json!(r.max_choices);
                     out["loop_breaks"] = json!(r.loop_breaks);
                     out["loop_turns"] = json!(r.loop_turns);
+                    out["responses"] = json!(r.responses);
                     if g.seats.iter().any(|p| p.starts_with("shadow:")) {
                         out["shadow"] = json!(r.shadow); // per seat: [asked, advice among the options, model chose otherwise]
                     }
                     if g.replay {
                         let file = format!("{}-j{}-g{}.json", g.name, g.job, g.idx);
-                        let rep = json!({"name": g.name, "job": g.job, "game": g.idx, "seed": g.seed, "seats": g.seats,
+                        let rep = json!({"name": g.name, "job": g.job, "game": g.idx, "seed": g.seed, "seats": g.seats, "decks": g.decks,
                             "winner": winner, "reason": reason, "turns": r.turns, "lp": r.lp, "names": r.names, "steps": r.steps,
                             "finished": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)});
                         if std::fs::write(dir.join(&file), rep.to_string()).is_ok() {
