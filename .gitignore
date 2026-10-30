@@ -1,3 +1,5 @@
 runner/target/
 __pycache__/
 runs/
+.pytest_cache/
+.ruff_cache/

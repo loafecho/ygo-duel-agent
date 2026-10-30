@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test tools
+        run: python -m pip install pytest==9.0.3 ruff==0.15.15
+      - name: Ruff
+        run: ruff check .
+      - name: Byte-compile every Python file
+        run: python -m compileall -q worker tools viewer tests
+      - name: Pytest
+        run: pytest -q
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck
+        run: shellcheck -S warning $(git ls-files '*.sh')
+      - name: Bash syntax
+        run: for f in $(git ls-files '*.sh'); do bash -n "$f"; done
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runner
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Type-check the runner (linking needs libocgcore, which CI does not build)
+        run: cargo check --locked --all-targets

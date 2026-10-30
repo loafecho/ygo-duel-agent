@@ -1,0 +1,9 @@
+line-length = 120
+target-version = "py310"
+
+[lint]
+# Ruff's classic default rule set (pyflakes + pycodestyle errors), listed explicitly so a newer Ruff
+# with different defaults does not move the gate. The ignored style rules are ones the research scripts
+# break on purpose: compact one-line imports and short loop names.
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E401", "E702", "E731", "E741"]
