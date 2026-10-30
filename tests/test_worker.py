@@ -115,6 +115,15 @@ def test_job_token_is_private_and_stable(worker):
     assert worker.job_token() == t
 
 
+def test_job_token_replaces_empty_or_partial_file(worker):
+    p = worker.DATA / "broker-token"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("")
+    worker._JOB_TOKEN.clear()
+    t = worker.job_token()
+    assert len(t) >= 32 and p.read_text() == t and (p.stat().st_mode & 0o777) == 0o600
+
+
 def test_send_answers_reports_rejected_ids(worker, monkeypatch):
     import io
     import urllib.error

@@ -113,12 +113,16 @@ def job_token() -> str:
     results of jobs submitted with it. Kept on disk so a restarted worker still collects its earlier jobs."""
     if not _JOB_TOKEN:
         p = DATA / "broker-token"
-        if not p.exists():
+        tok = p.read_text().strip() if p.exists() else ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", tok):  # missing, or empty/partial after a crash: make a new one
             p.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            tmp = p.with_name(p.name + ".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(secrets.token_urlsafe(32))
-        _JOB_TOKEN.append(p.read_text().strip())
+            os.replace(tmp, p)
+            tok = p.read_text().strip()
+        _JOB_TOKEN.append(tok)
     return _JOB_TOKEN[0]
 
 
