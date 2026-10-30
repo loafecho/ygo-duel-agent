@@ -83,6 +83,10 @@ pub trait Agent {
     fn shadow(&mut self) -> Option<&mut WindBot> {
         None
     }
+    /// The broker (job, game) this seat plays in, written into its DAgger labels as their provenance.
+    fn game_id(&self) -> Option<(u64, u32)> {
+        None
+    }
 }
 
 /// Imitation labels from WindBot seats, one JSON line per decision with 2+ options; YGO_LABELS sets the file.
@@ -94,12 +98,19 @@ fn write_label(v: &Value) -> Result<(), String> {
     write_to(&LABELS, "YGO_LABELS", "/srv/ygo/logs/windbot-labels.jsonl", v)
 }
 
+/// A label file stops growing at YGO_LABELS_MAX_BYTES (default 8 GiB): the game then fails with an error
+/// until the operator moves the file away.
 fn write_to(file: &std::sync::Mutex<Option<std::fs::File>>, var: &str, default: &str, v: &Value) -> Result<(), String> {
     use std::io::Write;
     let mut g = file.lock().map_err(|_| "labels lock poisoned")?;
     if g.is_none() {
         let path = std::env::var(var).unwrap_or(default.into());
         *g = Some(std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| format!("labels {path}: {e}"))?);
+    }
+    let max: u64 = std::env::var("YGO_LABELS_MAX_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(8 << 30);
+    let len = g.as_ref().unwrap().metadata().map(|m| m.len()).map_err(|e| format!("labels stat: {e}"))?;
+    if len >= max {
+        return Err(format!("labels file for {var} is over {max} bytes"));
     }
     writeln!(g.as_mut().unwrap(), "{v}").map_err(|e| format!("labels write: {e}"))
 }
@@ -481,6 +492,7 @@ pub fn play2(
                 counts: board.as_ref().map(|b| counts(b, d.player)).unwrap_or_default() }, &mut rng)?
         };
         if d.choices.len() > 1 && !looping && !rejected_now {
+            let game_id = agents[who].game_id();
             if let Some(w) = agents[who].shadow() {
                 let advice = w.respond(duel.0, &msg)?;
                 shadow[who][0] += 1;
@@ -489,7 +501,8 @@ pub fn play2(
                     shadow[who][2] += (k != i) as u32;
                     let (bt, ct) = texts.as_ref().ok_or("shadow seat without a board")?;
                     write_to(&DAGGER_LABELS, "YGO_DAGGER_LABELS", "/srv/ygo/logs/dagger-labels.jsonl",
-                        &json!({"seed": seed, "turn": view.turn, "player": d.player & 1, "kind": d.kind, "state": bt,
+                        &json!({"seed": seed, "job": game_id.map(|g| g.0), "game": game_id.map(|g| g.1), "decision": decisions,
+                            "turn": view.turn, "player": d.player & 1, "kind": d.kind, "state": bt,
                             "history": hist_text, "cards": ct, "options": options, "choice": k, "model_choice": i}))?;
                 }
             }

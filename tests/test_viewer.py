@@ -29,9 +29,17 @@ def viewer(tmp_path, monkeypatch):
     mod.H.log_message = lambda *a: None
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
+    _MODS[f"http://127.0.0.1:{srv.server_address[1]}"] = mod
     yield f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
     srv.server_close()
+
+
+_MODS = {}
+
+
+def _cache(url):
+    return _MODS[url]._cache
 
 
 def get(url):
@@ -65,3 +73,11 @@ def test_index_health_and_live_fallback(viewer):
     assert get(viewer + "/health") == (200, b"ok")
     assert get(viewer + "/api/live") == (200, b"[]")
     assert get(viewer + "/nope")[0] == 404
+
+
+def test_cache_forgets_deleted_replays(viewer, tmp_path):
+    get(viewer + "/api/games")
+    (tmp_path / "replays" / "a.json").unlink()
+    code, body = get(viewer + "/api/games")
+    assert code == 200 and [g["name"] for g in json.loads(body)] == ["new"]
+    assert "a.json" not in _cache(viewer)

@@ -4,7 +4,7 @@ JSON line per decision with 2+ options to the server's YGO_LABELS file on the ga
 collects the results; the labels themselves land on the game host.
 
   python3 tools/label_games.py --server http://198.51.100.10:8766 --games 200
-Only one consumer may poll /next at a time (results are handed out once).
+/next returns this job's results only to the holder of the token POST /job hands back.
 """
 import argparse, json, time, urllib.request
 
@@ -18,9 +18,12 @@ ap.add_argument("--opp-decks", default="")
 a = ap.parse_args()
 
 
+TOKEN = ""
+
+
 def call(path, body=None, timeout=60):
     req = urllib.request.Request(a.server + path, None if body is None else json.dumps(body).encode(),
-                                 {"Content-Type": "application/json"})
+                                 {"Content-Type": "application/json", "X-Job-Token": TOKEN})
     return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
 
 
@@ -33,13 +36,14 @@ if a.deck or a.opp_decks:
                       "decks": [a.deck or None, o] if g % 2 == 0 else [o, a.deck or None]})
 else:
     games = [{"seats": ["windbot-labels", "windbot-labels"]} for _ in range(a.games)]
-job = call("/job", {"name": "windbot-labels", "seed": int(time.time()), "games": games})["job"]
+posted = call("/job", {"name": "windbot-labels", "seed": int(time.time()), "games": games})
+job, TOKEN = posted["job"], posted["token"]
 print(json.dumps({"event": "job", "job": job, "games": a.games}), flush=True)
 results, t0 = [], time.time()
 while len(results) < a.games:
     nxt = call("/next?max=64&wait=5&gather=50")
     if nxt["requests"]:
-        call("/answer", [{"id": r["id"], "choice": 0} for r in nxt["requests"]])  # none expected: no remote seats
+        call("/answer", [{"id": r["id"], "lease": r["lease"], "choice": 0} for r in nxt["requests"]])  # none expected: no remote seats
     for res in nxt["results"]:
         if res.get("job") == job:
             results.append(res)

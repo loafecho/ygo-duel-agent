@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Round 5 DAgger aggregation: an existing label set (build_labels.py format: {"src","prompt","n","choice","held"})
 plus the shadow-WindBot labels of one collection run (the runner's YGO_DAGGER_LABELS lines), kept only for the games
-of that run (their seeds, from the worker's match-state.json). Held-out: seed hash 0 mod 10, as build_labels.py.
+of that run: the label's (job, game) must be a finished game of a job in the worker's match-state.json (a seed alone
+proves nothing; anyone can play a game on a known seed). One row per (job, game, decision); rows with no job (written
+by an older runner) are dropped. Held-out: seed hash 0 mod 10, as build_labels.py.
 
   python3 tools/build_dagger.py --base labels-dagger.jsonl --dagger dagger-labels.jsonl \\
       --state m-dagger2-collect/match-state.json --src dagger2 --out labels-dagger2.jsonl --base-ratio 1
@@ -29,13 +31,25 @@ def held(seed):
     return int(hashlib.sha256(str(seed).encode()).hexdigest(), 16) % 10 == 0
 
 
-seeds = {r["seed"] for r in json.load(open(a.state))["results"].values() if "error" not in r}
+state = json.load(open(a.state))
+games = {}  # (job, index within the job) -> seed, for the run's finished games
+for job, idxs in state["jobs"].items():
+    for k, orig in enumerate(idxs):
+        res = state["results"].get(str(orig))
+        if res and "error" not in res and str(res.get("job")) == job:
+            games[(int(job), k)] = res["seed"]
 rows = [json.loads(l) for l in open(a.base)]
 base_n = len(rows)
-new = 0
+new = dropped = 0
+seen = set()
 for line in open(a.dagger):
     r = json.loads(line)
-    if r["seed"] not in seeds or len(r["options"]) < 2 or not 0 <= r["choice"] < len(r["options"]):
+    key = (r.get("job"), r.get("game"), r.get("decision"))
+    if games.get(key[:2]) != r["seed"] or key in seen:
+        dropped += 1
+        continue
+    seen.add(key)
+    if len(r["options"]) < 2 or not 0 <= r["choice"] < len(r["options"]):
         continue
     rows.append({"src": a.src, "prompt": prompt(r["state"], r["cards"], r["kind"], r["options"], r.get("history", "")),
                  "n": len(r["options"]), "choice": r["choice"], "held": held(r["seed"])})
@@ -50,4 +64,5 @@ random.Random(1).shuffle(rows)
 with open(a.out, "w") as f:
     for r in rows:
         f.write(json.dumps(r) + "\n")
-print(f"dagger_labels base={base_n} (ratio {a.base_ratio or 'all'}) new={new} games={len(seeds)} total={len(rows)} file={a.out}")
+print(f"dagger_labels base={base_n} (ratio {a.base_ratio or 'all'}) new={new} dropped={dropped} games={len(games)} "
+      f"total={len(rows)} file={a.out}")

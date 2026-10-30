@@ -35,6 +35,8 @@ import re
 import signal
 import sys
 import time
+import secrets
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -103,15 +105,34 @@ def on_term(signum, frame) -> None:
     STOP = True
 
 
+_JOB_TOKEN: list[str] = []
+
+
+def job_token() -> str:
+    """This worker's job token (DATA/broker-token, made once): sent with every job, and /next returns only the
+    results of jobs submitted with it. Kept on disk so a restarted worker still collects its earlier jobs."""
+    if not _JOB_TOKEN:
+        p = DATA / "broker-token"
+        if not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(secrets.token_urlsafe(32))
+        _JOB_TOKEN.append(p.read_text().strip())
+    return _JOB_TOKEN[0]
+
+
 def http(path: str, body=None, timeout: float = 40):
+    if path == "/job" and isinstance(body, dict):
+        body = dict(body, token=job_token())
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(SERVER + path, data, {"Content-Type": "application/json"})
+    req = urllib.request.Request(SERVER + path, data, {"Content-Type": "application/json", "X-Job-Token": job_token()})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read()
     try:
         return json.loads(raw or b"null")
     except ValueError:
-        return raw.decode(errors="replace")  # /answer and /health reply with plain "ok"
+        return raw.decode(errors="replace")  # /health replies with plain "ok"
 
 
 class Stopped(Exception):
@@ -128,6 +149,30 @@ def server_call(path: str, body=None, timeout: float = 40):
                 raise Stopped() from e
             log("server_wait", path=path, err=f"{type(e).__name__}: {e}"[:200])
             time.sleep(3)
+
+
+def send_answers(answers: list[dict]) -> list:
+    """POST /answer (each answer carries the lease its request came with). Returns the ids the server refused
+    (unknown, already answered, or a lease that went stale while the worker was away); they are logged."""
+    while True:
+        try:
+            http("/answer", answers)
+            return []
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                try:
+                    rejected = json.loads(e.read() or b"{}").get("rejected", [])
+                except ValueError:
+                    rejected = []
+                log("answer_rejected", n=len(rejected), ids=rejected[:20])
+                return rejected
+            err: Exception = e
+        except Exception as e:
+            err = e
+        if STOP:
+            raise Stopped() from err
+        log("server_wait", path="/answer", err=f"{type(err).__name__}: {err}"[:200])
+        time.sleep(3)
 
 
 def save_json(p: Path, obj) -> None:
@@ -391,15 +436,15 @@ def run_match(name: str, games: list[dict], players: dict, state_file: Path, see
         answers = []
         mine = [r for r in nxt["requests"] if str(r["job"]) in st["jobs"]]
         other = [r for r in nxt["requests"] if str(r["job"]) not in st["jobs"]]
-        answers += [{"id": r["id"], "choice": random.randrange(r["n"])} for r in other]  # stale games: let them end
+        answers += [{"id": r["id"], "lease": r["lease"], "choice": random.randrange(r["n"])} for r in other]  # stale games: let them end
         by_tag: dict[str, list] = {}
         for r in mine:
             by_tag.setdefault(r["policy"], []).append(r)
         for tag, rs in by_tag.items():
             for r, (a, _) in zip(rs, players[tag](rs)):
-                answers.append({"id": r["id"], "choice": a})
+                answers.append({"id": r["id"], "lease": r["lease"], "choice": a})
         if answers:
-            server_call("/answer", answers)
+            send_answers(answers)
         for res in nxt["results"]:
             idxs = st["jobs"].get(str(res["job"]))
             if idxs is not None:
@@ -691,7 +736,7 @@ def train_loop(s, sc, model, opt, buffer, traj, pool, save_ckpt, add_pool, tick,
         reqs = nxt["requests"]
         answers = []
         mine = [r for r in reqs if r["job"] in s["jobs"]]
-        answers += [{"id": r["id"], "choice": random.randrange(r["n"])} for r in reqs if r["job"] not in s["jobs"]]
+        answers += [{"id": r["id"], "lease": r["lease"], "choice": random.randrange(r["n"])} for r in reqs if r["job"] not in s["jobs"]]
         by_tag: dict[str, list] = {}
         for r in mine:
             by_tag.setdefault(r["policy"], []).append(r)
@@ -701,14 +746,14 @@ def train_loop(s, sc, model, opt, buffer, traj, pool, save_ckpt, add_pool, tick,
                 state = next(iter(pool.values()), None)  # pool entry rotated out: use the oldest live one
             picks = choose(sc, rs, greedy=False, temp=R["temp"], state=state)
             for r, (a, lp) in zip(rs, picks):
-                answers.append({"id": r["id"], "choice": a})
+                answers.append({"id": r["id"], "lease": r["lease"], "choice": a})
                 if tag == "learner":
                     traj.setdefault(f"{r['job']}:{r['idx']}:{r['seat']}", []).append(
                         {"prompt": r["prompt"], "n": r["n"], "a": a, "logp": lp, "phi": (r["lp"][0] - r["lp"][1]) / 8000,
                          "turn": r.get("turn")})
                     s["decisions"] += 1
         if answers:
-            server_call("/answer", answers)
+            send_answers(answers)
         for res in nxt["results"]:
             if res["job"] in s["jobs"]:
                 finish_game(res)
@@ -1608,21 +1653,21 @@ def practice() -> None:
             nxt = server_call("/next?max=256&wait=2&gather=50", timeout=40)
             answers = []
             mine = [r for r in nxt["requests"] if r["job"] in s["jobs"]]
-            answers += [{"id": r["id"], "choice": random.randrange(r["n"])} for r in nxt["requests"] if r["job"] not in s["jobs"]]
+            answers += [{"id": r["id"], "lease": r["lease"], "choice": random.randrange(r["n"])} for r in nxt["requests"] if r["job"] not in s["jobs"]]
             by_tag: dict[str, list] = {}
             for r in mine:
                 by_tag.setdefault(r["policy"], []).append(r)
             for tag, rs in by_tag.items():
                 state = (pool.get(tag[5:]) or next(iter(pool.values()))) if tag.startswith("pool:") else None
                 for r, (a, lp, v) in zip(rs, play(rs, greedy=False, state=state)):
-                    answers.append({"id": r["id"], "choice": a})
+                    answers.append({"id": r["id"], "lease": r["lease"], "choice": a})
                     if tag == "learner":
                         traj.setdefault(f"{r['job']}:{r['idx']}:{r['seat']}", []).append(
                             {"prompt": r["prompt"], "n": r["n"], "a": a, "logp": lp, "v": v,
                              "phi": (r["lp"][0] - r["lp"][1]) / 8000, "turn": r.get("turn"), "counts": r.get("counts")})
                         s["decisions"] += 1
             if answers:
-                server_call("/answer", answers)
+                send_answers(answers)
             for res in nxt["results"]:
                 if res["job"] in s["jobs"]:
                     finish(res)

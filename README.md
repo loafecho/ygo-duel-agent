@@ -42,9 +42,11 @@ server, `broker.rs`), `optcheck` (sampled options re-parse identically), `leakch
 player's prompts), `ceiling` (WindBot vs WindBot per deck).
 
 **Game server protocol (`broker.rs`).** The worker connects out; nothing on the GPU machine listens.
-`POST /job` queues games with a policy tag per seat, `GET /next` long-polls for waiting decisions and finished
-results, `POST /answer` returns choices. A request handed out but unanswered for 90 s is handed out again, so a
-worker that was stopped for a game loses nothing; a duel waiting on the worker simply waits.
+`POST /job` queues games with a policy tag per seat and returns a job token, `GET /next` long-polls for waiting
+decisions and the finished results of the caller's job token, `POST /answer` returns choices under the lease each
+decision was handed out with (unknown, stale or repeated answers get a 409). A request handed out but unanswered
+for 90 s is handed out again under a new lease, so a worker that was stopped for a game loses nothing; a duel
+waiting on the worker simply waits.
 
 **Worker (`worker/worker.py`).** Each decision is one forward pass: the prompt ends in a lettered option list and
 `Answer:`, and the policy is the softmax of the first-token logits over the option letters. Modes:

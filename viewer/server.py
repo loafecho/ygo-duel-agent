@@ -48,7 +48,11 @@ class H(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             return self.send(200, (HERE / "index.html").read_bytes(), "text/html; charset=utf-8")
         if path == "/api/games":
-            games = [s for p in REPLAYS.glob("*.json") if (s := summary(p))]
+            files = list(REPLAYS.glob("*.json"))
+            games = [s for p in files if (s := summary(p))]
+            live = {p.name for p in files}
+            for k in [k for k in list(_cache) if k not in live]:
+                _cache.pop(k, None)  # replay deleted: forget it, so the cache never outgrows the directory
             games.sort(key=lambda s: (s["finished"], s["file"]), reverse=True)
             return self.send(200, json.dumps(games).encode(), "application/json")
         if path.startswith("/replays/"):

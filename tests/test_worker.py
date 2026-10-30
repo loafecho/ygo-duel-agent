@@ -105,3 +105,24 @@ def test_held_game_is_stable_and_about_one_in_ten(worker):
     held = [worker.held_game(k) for k in range(2000)]
     assert held == [worker.held_game(k) for k in range(2000)]
     assert 150 < sum(held) < 250
+
+
+def test_job_token_is_private_and_stable(worker):
+    t = worker.job_token()
+    p = worker.DATA / "broker-token"
+    assert len(t) >= 32 and p.read_text() == t and (p.stat().st_mode & 0o777) == 0o600
+    worker._JOB_TOKEN.clear()
+    assert worker.job_token() == t
+
+
+def test_send_answers_reports_rejected_ids(worker, monkeypatch):
+    import io
+    import urllib.error
+
+    def refuse(path, body=None, timeout=40):
+        raise urllib.error.HTTPError(path, 409, "Conflict", {}, io.BytesIO(b'{"accepted": 1, "rejected": [7]}'))
+
+    monkeypatch.setattr(worker, "http", refuse)
+    assert worker.send_answers([{"id": 7, "lease": "x", "choice": 0}]) == [7]
+    monkeypatch.setattr(worker, "http", lambda *a, **k: {"accepted": 1})
+    assert worker.send_answers([{"id": 8, "lease": "y", "choice": 0}]) == []
