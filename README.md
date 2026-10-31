@@ -97,12 +97,16 @@ Game host (Linux, CPU only):
 3. `cd runner && cargo build --release`, then `ygo-runner random --games 100` to check the engine works.
 4. Optional: build ProjectIgnis WindBot and run it in ServerMode (`deploy/ygo-windbot.service`).
 5. Start `ygo-runner serve` and `viewer/server.py` (`deploy/ygo-server.service`, `deploy/ygo-viewer.service`).
+   The units run as an unprivileged `ygo` user under systemd sandboxing. `ygo-server` reads a shared secret from
+   `/etc/ygo/broker-auth` (`serve --auth-file`, 16+ random characters). Without it, `/job`, `/next`, `/answer` and
+   `/cancel` answer 401. `/health`, `/status` and `/live` stay open.
 
 GPU workstation:
 
 1. Create a venv with torch, transformers and peft (the versions used are in `worker/pipeline.sh`) and copy
    `worker/` to `~/.local/share/ygo-worker/app/`.
-2. Point the worker at the game server: `export YGO_BROKER=http://game-host.example:8765`.
+2. Point the worker at the game server: `export YGO_BROKER=http://game-host.example:8765`, and at a copy of its
+   secret: `export YGO_BROKER_AUTH_FILE=~/.config/ygo/broker-auth` (mode 0600).
 3. Run a mode under the guard: `worker/supervisor.py train` (logs in `~/.local/share/ygo-worker/logs/`).
 
 `YGO_CARD_TEXT=oneliner` reads a JSON file of one-line card summaries (`YGO_ONELINERS`, a `{"card name":

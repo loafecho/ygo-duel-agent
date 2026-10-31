@@ -126,11 +126,29 @@ def job_token() -> str:
     return _JOB_TOKEN[0]
 
 
+_BROKER_AUTH: list[str] = []
+
+
+def broker_auth() -> str:
+    """The game server's shared secret, read from the file YGO_BROKER_AUTH_FILE names ("" when unset: an open
+    server). A set but missing, empty or malformed file is an error, so a misconfigured worker stops at once."""
+    if not _BROKER_AUTH:
+        f = os.environ.get("YGO_BROKER_AUTH_FILE", "")
+        tok = Path(f).read_text().strip() if f else ""
+        if f and not re.fullmatch(r"[\x21-\x7e]{16,512}", tok):
+            raise SystemExit(f"YGO_BROKER_AUTH_FILE {f}: need 16-512 printable characters, no spaces")
+        _BROKER_AUTH.append(tok)
+    return _BROKER_AUTH[0]
+
+
 def http(path: str, body=None, timeout: float = 40):
     if path == "/job" and isinstance(body, dict):
         body = dict(body, token=job_token())
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(SERVER + path, data, {"Content-Type": "application/json", "X-Job-Token": job_token()})
+    headers = {"Content-Type": "application/json", "X-Job-Token": job_token()}
+    if broker_auth():
+        headers["Authorization"] = "Bearer " + broker_auth()
+    req = urllib.request.Request(SERVER + path, data, headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read()
     try:

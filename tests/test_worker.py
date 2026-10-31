@@ -135,3 +135,51 @@ def test_send_answers_reports_rejected_ids(worker, monkeypatch):
     assert worker.send_answers([{"id": 7, "lease": "x", "choice": 0}]) == [7]
     monkeypatch.setattr(worker, "http", lambda *a, **k: {"accepted": 1})
     assert worker.send_answers([{"id": 8, "lease": "y", "choice": 0}]) == []
+
+
+def _sent_headers(worker, monkeypatch):
+    seen = {}
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(req, timeout=None):
+        seen.update({k.lower(): v for k, v in req.header_items()})
+        return Resp()
+
+    monkeypatch.setattr(worker.urllib.request, "urlopen", fake_urlopen)
+    worker.http("/status")
+    return seen
+
+
+def test_http_sends_the_broker_secret_from_its_file(worker, monkeypatch, tmp_path):
+    f = tmp_path / "broker-auth"
+    f.write_text("abcdefghijklmnop-0123\n")
+    monkeypatch.setenv("YGO_BROKER_AUTH_FILE", str(f))
+    worker._BROKER_AUTH.clear()
+    assert _sent_headers(worker, monkeypatch)["authorization"] == "Bearer abcdefghijklmnop-0123"
+
+
+def test_http_sends_no_secret_when_none_is_configured(worker, monkeypatch):
+    monkeypatch.delenv("YGO_BROKER_AUTH_FILE", raising=False)
+    worker._BROKER_AUTH.clear()
+    assert "authorization" not in _sent_headers(worker, monkeypatch)
+
+
+def test_a_bad_broker_secret_file_stops_the_worker(worker, monkeypatch, tmp_path):
+    import pytest
+
+    f = tmp_path / "broker-auth"
+    f.write_text("short")
+    monkeypatch.setenv("YGO_BROKER_AUTH_FILE", str(f))
+    worker._BROKER_AUTH.clear()
+    with pytest.raises(SystemExit):
+        worker.broker_auth()
+    worker._BROKER_AUTH.clear()

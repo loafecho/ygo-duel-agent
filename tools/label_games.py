@@ -6,7 +6,7 @@ collects the results; the labels themselves land on the game host.
   python3 tools/label_games.py --server http://198.51.100.10:8766 --games 200
 /next returns this job's results only to the holder of the token POST /job hands back.
 """
-import argparse, json, time, urllib.request
+import argparse, json, os, time, urllib.request
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--server", default="http://198.51.100.10:8766")
@@ -19,11 +19,12 @@ a = ap.parse_args()
 
 
 TOKEN = ""
+AUTH = {"Authorization": "Bearer " + open(os.environ["YGO_BROKER_AUTH_FILE"]).read().strip()} if os.environ.get("YGO_BROKER_AUTH_FILE") else {}  # the game server's shared secret, if it has one
 
 
 def call(path, body=None, timeout=60):
     req = urllib.request.Request(a.server + path, None if body is None else json.dumps(body).encode(),
-                                 {"Content-Type": "application/json", "X-Job-Token": TOKEN})
+                                 {"Content-Type": "application/json", "X-Job-Token": TOKEN, **AUTH})
     return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
 
 

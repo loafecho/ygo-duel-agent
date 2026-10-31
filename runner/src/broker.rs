@@ -16,6 +16,9 @@
 //!   POST /cancel  drop games not started yet -> {"cancelled": n}
 //!   GET  /live    the latest move (board, options, choice) of every running game marked "live"
 //!   GET  /status (with "active": {job: games queued or running}), GET /health
+//! Auth: started with a shared secret (serve --auth-file, or YGO_BROKER_AUTH_FILE), every route but /health,
+//! /status and /live needs "Authorization: Bearer <secret>" and answers 401 without it. /job, /next, /answer
+//! and /cancel steer games and training labels, so a broker reachable off-host should always have one.
 //! Job ids start from the clock, so they never repeat across restarts.
 //! A request handed out but unanswered for 90 s is handed out again (the worker may have been stopped
 //! for a game); a duel waiting on the worker just waits, it never times out.
@@ -59,8 +62,8 @@ struct Pending {
     answer: Option<usize>,
 }
 
-/// 128 random bits as hex, for job tokens and decision leases.
-fn token() -> String {
+/// 128 random bits as hex, for job tokens, decision leases and WindBot room passwords.
+pub(crate) fn token() -> String {
     let mut b = [0u8; 16];
     std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).expect("read /dev/urandom");
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -73,6 +76,21 @@ fn valid_name(n: &str) -> bool {
 
 fn valid_token(t: &str) -> bool {
     (16..=128).contains(&t.len()) && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The broker's shared secret from a file: trimmed, 16-512 printable ASCII characters with no spaces.
+pub fn read_auth_file(path: &Path) -> Result<String, String> {
+    let s = std::fs::read_to_string(path).map_err(|e| format!("auth file {}: {e}", path.display()))?;
+    let s = s.trim();
+    if !(16..=512).contains(&s.len()) || !s.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(format!("auth file {}: need 16-512 printable characters, no spaces", path.display()));
+    }
+    Ok(s.to_string())
+}
+
+/// Compares in time that depends only on the lengths, so a peer cannot find the secret byte by byte.
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
 /// Reads with one deadline for the whole request, so a peer trickling bytes cannot hold a connection open.
@@ -115,16 +133,17 @@ struct State {
     answered: u64,
     games_done: u64,
     errors: u64,
+    auth: Option<String>, // shared secret every steering route needs; None = open (loopback or a trusted LAN only)
 }
 
 #[derive(Clone)]
 pub struct Broker(Arc<(Mutex<State>, Condvar)>);
 
 impl Broker {
-    pub fn start(addr: &str) -> Result<Broker, String> {
+    pub fn start(addr: &str, auth: Option<String>) -> Result<Broker, String> {
         let listener = TcpListener::bind(addr).map_err(|e| format!("bind {addr}: {e}"))?;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let st = State { next_job: now * 1000, ..Default::default() };
+        let st = State { next_job: now * 1000, auth, ..Default::default() };
         let b = Broker(Arc::new((Mutex::new(st), Condvar::new())));
         let bc = b.clone();
         let conns = Arc::new(AtomicUsize::new(0));
@@ -168,6 +187,7 @@ impl Broker {
         let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         let mut clen = 0usize;
+        let mut bearer = String::new();
         let mut job_token = String::new();
         loop {
             let mut h = String::new();
@@ -180,13 +200,22 @@ impl Broker {
             if h.to_ascii_lowercase().starts_with("x-job-token:") {
                 job_token = h["x-job-token:".len()..].trim().to_string();
             }
+            if h.to_ascii_lowercase().starts_with("authorization:") {
+                let v = h["authorization:".len()..].trim();
+                if v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer ") {
+                    bearer = v[7..].trim().to_string();
+                }
+            }
         }
         let mut body = vec![0u8; clen.min(MAX_BODY)];
         rd.read_exact(&mut body)?;
         let q = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(k)).and_then(|v| v.parse::<u64>().ok());
         let (qmax, qwait) = (q("max=").unwrap_or(64) as usize, q("wait=").unwrap_or(25).min(25));
         let qgather = q("gather=").unwrap_or(0).min(2000);
+        let open_route = matches!((method, path), ("GET", "/health") | ("GET", "/status") | ("GET", "/live"));
+        let authorized = open_route || self.0 .0.lock().unwrap().auth.as_deref().map_or(true, |a| same_secret(a.as_bytes(), bearer.as_bytes()));
         let (code, out) = match (method, path) {
+            _ if !authorized => (401, "need Authorization: Bearer <broker secret>".to_string()),
             ("GET", "/health") => (200, "ok".to_string()),
             ("GET", "/status") => (200, self.status().to_string()),
             ("GET", "/live") => (200, self.live_games().to_string()),
@@ -219,7 +248,7 @@ impl Broker {
             ("POST", "/cancel") => (200, json!({"cancelled": self.cancel()}).to_string()),
             _ => (404, "not found".into()),
         };
-        let reason = match code { 200 => "OK", 400 => "Bad Request", 409 => "Conflict", _ => "Not Found" };
+        let reason = match code { 200 => "OK", 400 => "Bad Request", 401 => "Unauthorized", 409 => "Conflict", _ => "Not Found" };
         write!(s, "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}", out.len())?;
         s.flush()
     }
@@ -712,6 +741,46 @@ mod tests {
         let body = r#"[{"id":1,"lease":"x","choice":0}]"#;
         let r = http(&b, &format!("POST /answer HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len()));
         assert!(r.starts_with("HTTP/1.1 409") && r.contains(r#""rejected":[1]"#), "{r}");
+    }
+
+    #[test]
+    fn steering_routes_need_the_broker_secret() {
+        let b = broker();
+        b.0 .0.lock().unwrap().auth = Some("s3cret-s3cret-s3cret".into());
+        let job = r#"{"name":"t","games":[]}"#;
+        for auth in ["", "Authorization: Bearer wrong-wrong-wrong-wr\r\n", "Authorization: Bearer s3cret-s3cret-s3cre\r\n"] {
+            let r = http(&b, &format!("POST /job HTTP/1.1\r\n{auth}Content-Length: {}\r\n\r\n{job}", job.len()));
+            assert!(r.starts_with("HTTP/1.1 401"), "{auth}: {r}");
+            assert!(http(&b, &format!("GET /next?wait=0 HTTP/1.1\r\n{auth}\r\n")).starts_with("HTTP/1.1 401"));
+            assert!(http(&b, &format!("POST /cancel HTTP/1.1\r\n{auth}\r\n")).starts_with("HTTP/1.1 401"));
+            let ans = r#"[{"id":1,"lease":"x","choice":0}]"#;
+            let r = http(&b, &format!("POST /answer HTTP/1.1\r\n{auth}Content-Length: {}\r\n\r\n{ans}", ans.len()));
+            assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+        }
+        assert!(b.0 .0.lock().unwrap().active.is_empty(), "no job was queued without the secret");
+        let ok = "Authorization: bearer s3cret-s3cret-s3cret\r\n";
+        let r = http(&b, &format!("POST /job HTTP/1.1\r\n{ok}Content-Length: {}\r\n\r\n{job}", job.len()));
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(http(&b, &format!("GET /next?wait=0 HTTP/1.1\r\n{ok}\r\n")).starts_with("HTTP/1.1 200"));
+        for open in ["GET /health", "GET /status", "GET /live"] {
+            assert!(http(&b, &format!("{open} HTTP/1.1\r\n\r\n")).starts_with("HTTP/1.1 200"), "{open}");
+        }
+    }
+
+    #[test]
+    fn auth_file_is_checked() {
+        let dir = std::env::temp_dir().join(format!("ygo-auth-{}", token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("auth");
+        std::fs::write(&f, "  abcdefghijklmnop0123\n").unwrap();
+        assert_eq!(read_auth_file(&f).unwrap(), "abcdefghijklmnop0123");
+        for bad in ["", "short", "has a space in it ok"] {
+            std::fs::write(&f, bad).unwrap();
+            assert!(read_auth_file(&f).is_err(), "{bad:?}");
+        }
+        assert!(read_auth_file(&dir.join("missing")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(same_secret(b"abc", b"abc") && !same_secret(b"abc", b"abd") && !same_secret(b"abc", b"abcd"));
     }
 
     #[test]

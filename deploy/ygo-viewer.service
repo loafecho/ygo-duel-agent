@@ -3,10 +3,25 @@ Description=ygo-duel-agent replay viewer (:8080)
 After=network-online.target
 
 [Service]
+# Read-only: it serves replays and proxies the game server's /live, so it needs no write access anywhere.
+User=ygo
+Group=ygo
 ExecStart=/usr/bin/python3 /srv/ygo/viewer/server.py
 Environment=YGO_REPLAYS=/srv/ygo/replays
 Restart=always
 RestartSec=3
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target

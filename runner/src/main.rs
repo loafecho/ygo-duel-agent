@@ -2,6 +2,7 @@
 //!   ygo-runner random [--games 100] [--seed 1] [--replays N]   random vs random; first N games saved as replays
 //!   ygo-runner prompt [--seed 1] [--turn 3]                    print one real model prompt from a random game
 //!   ygo-runner serve [--listen 0.0.0.0:8765] [--threads 48]    game server for the GPU worker (broker.rs)
+//!                    [--auth-file F]   shared secret (or YGO_BROKER_AUTH_FILE) the steering routes require
 //!   ygo-runner optcheck [--decisions 500]                       round 4: sampled options re-parse identically
 //!   ygo-runner leakcheck --opp-deck X.ydk [--prompts 2000]      round 4: no hidden opponent card in player 0's prompts
 //! Paths: --deck, --scripts, --cdb (repeatable), --log (one JSON line per game), --replay-dir.
@@ -328,7 +329,13 @@ fn main() {
     if mode == "serve" {
         let addr = flag("--listen").unwrap_or("0.0.0.0:8765".into());
         let threads: usize = flag("--threads").map(|t| t.parse().expect("--threads")).unwrap_or(48);
-        let b = broker::Broker::start(&addr).unwrap_or_else(|e| panic!("{e}"));
+        let auth_file = flag("--auth-file").or_else(|| std::env::var("YGO_BROKER_AUTH_FILE").ok()).filter(|f| !f.is_empty());
+        let auth = auth_file.map(|f| broker::read_auth_file(&PathBuf::from(f)).unwrap_or_else(|e| panic!("{e}")));
+        let loopback = addr.starts_with("127.") || addr.starts_with("[::1]") || addr.starts_with("localhost:");
+        if auth.is_none() && !loopback {
+            eprintln!("warning: game server on {addr} with no --auth-file: any peer that reaches it can queue, cancel and answer games");
+        }
+        let b = broker::Broker::start(&addr, auth).unwrap_or_else(|e| panic!("{e}"));
         println!("game server on {addr}, {threads} game threads, replays in {}", replay_dir.display());
         broker::run_games(b, Arc::new(lib), Arc::new(deck), threads, replay_dir);
         loop {

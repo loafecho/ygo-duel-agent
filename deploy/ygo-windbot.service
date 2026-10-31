@@ -3,10 +3,27 @@ Description=WindBot server (ProjectIgnis/windbot, ServerMode) for ygo-runner's w
 After=network.target
 
 [Service]
+# Only the local game server calls WindBot, so :2399 takes loopback peers only. WindBot writes its own
+# logs next to the binary, so /srv/ygo/windbot-bin stays writable (chown it to ygo).
+User=ygo
+Group=ygo
 ExecStart=/usr/bin/dotnet /srv/ygo/windbot-bin/WindBot.dll ServerMode=true ServerPort=2399 DbPath=/srv/ygo/windbot-bin/cards.cdb
 WorkingDirectory=/srv/ygo/windbot-bin
+Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1 HOME=/srv/ygo/windbot-bin
 Restart=always
 RestartSec=3
+IPAddressDeny=any
+IPAddressAllow=localhost
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=/srv/ygo/windbot-bin
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
 
 [Install]
 WantedBy=multi-user.target

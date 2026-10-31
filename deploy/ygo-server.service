@@ -3,10 +3,29 @@ Description=ygo-duel-agent game server for the GPU worker (:8765)
 After=network-online.target
 
 [Service]
-ExecStart=/srv/ygo/runner/target/release/ygo-runner serve --listen 0.0.0.0:8765 --threads 96 --log /srv/ygo/logs/serve-games.jsonl --deck /srv/ygo/AI_CyberDragon.ydk
+# Runs as the unprivileged ygo user (useradd --system ygo; chown it /srv/ygo/logs and /srv/ygo/replays).
+# The worker reaches :8765 over the network, so the steering routes need the shared secret in
+# /etc/ygo/broker-auth (root:root 0600, 16+ random characters); systemd hands it in as a credential.
+User=ygo
+Group=ygo
+LoadCredential=broker-auth:/etc/ygo/broker-auth
+ExecStart=/srv/ygo/runner/target/release/ygo-runner serve --listen 0.0.0.0:8765 --auth-file %d/broker-auth --threads 96 --log /srv/ygo/logs/serve-games.jsonl --deck /srv/ygo/AI_CyberDragon.ydk
 WorkingDirectory=/srv/ygo/runner
 Restart=always
 RestartSec=3
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=/srv/ygo/logs /srv/ygo/replays
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target

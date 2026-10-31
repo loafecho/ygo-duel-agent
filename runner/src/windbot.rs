@@ -4,6 +4,8 @@
 //! (decisions and private hints only to their player, the other player's hidden card codes zeroed) and
 //! refreshes the field with MSG_UPDATE_DATA before each of the bot's decisions. The bot's CTOS_RESPONSE
 //! bytes go straight to OCG_DuelSetResponse.
+//! Any local process can see and connect to the loopback port, so each call carries a fresh room password
+//! (WindBot's "password" parameter, sent back in CTOS_JOIN_GAME) and a connection without it is dropped.
 use crate::decide;
 use crate::ffi::*;
 use std::io::{Read, Write};
@@ -30,6 +32,7 @@ const MSG_SET: u8 = 54;
 const MSG_DRAW: u8 = 90;
 const MSG_MISSED_EFFECT: u8 = 120;
 const HANDSHAKE: u32 = 4043399681;
+const ROOM_PASS_LEN: usize = 16;
 const POS_FACEDOWN: u32 = 0xA;
 /// The query fields WindBot's ClientCard.Update reads. Any other field would hit its ReadChars fallback,
 /// which decodes text and can misread binary, so only these are sent.
@@ -54,9 +57,10 @@ impl WindBot {
     pub fn connect(server: &str, deck: &str, seat: u8, name: &str) -> Result<WindBot, String> {
         let l = TcpListener::bind("127.0.0.1:0").map_err(io("listen"))?;
         let port = l.local_addr().map_err(io("listen"))?.port();
+        let pass = &crate::broker::token()[..ROOM_PASS_LEN]; // 64 random bits; WindBot sends at most 19 characters
         let mut h = TcpStream::connect(server).map_err(io("server connect"))?;
         h.set_read_timeout(Some(Duration::from_secs(10))).ok();
-        write!(h, "GET /?name={name}&deck={deck}&host=127.0.0.1&port={port} HTTP/1.0\r\nHost: {server}\r\n\r\n")
+        write!(h, "GET /?name={name}&deck={deck}&host=127.0.0.1&port={port}&password={pass} HTTP/1.0\r\nHost: {server}\r\n\r\n")
             .map_err(io("server request"))?;
         let mut resp = String::new();
         let _ = h.read_to_string(&mut resp);
@@ -65,24 +69,30 @@ impl WindBot {
         }
         l.set_nonblocking(true).map_err(io("listen"))?;
         let t0 = Instant::now();
-        let s = loop {
+        let mut wb = loop {
             match l.accept() {
-                Ok((s, _)) => break s,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if t0.elapsed() > Duration::from_secs(30) {
-                        return Err("windbot never connected (30 s)".into());
+                Ok((mut s, _)) => {
+                    // Only the bot we called knows the password; anything else is dropped and we keep waiting.
+                    s.set_nonblocking(false).map_err(io("socket"))?;
+                    s.set_nodelay(true).ok();
+                    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                    match expect_on(&mut s, CTOS_PLAYER_INFO).and_then(|_| expect_on(&mut s, CTOS_JOIN_GAME)) {
+                        Ok(join) if join_password(&join).as_deref() == Some(pass) => break WindBot { seat, s, fallbacks: 0, decisions: 0 },
+                        r => {
+                            eprintln!("windbot seat {seat}: dropped a loopback connection without the room password ({:?})", r.err());
+                            let _ = s.shutdown(std::net::Shutdown::Both);
+                        }
                     }
-                    std::thread::sleep(Duration::from_millis(5));
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(format!("windbot accept: {e}")),
             }
+            if t0.elapsed() > Duration::from_secs(30) {
+                return Err("windbot never connected with the room password (30 s)".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
         };
-        s.set_nonblocking(false).map_err(io("socket"))?;
-        s.set_nodelay(true).ok();
-        s.set_read_timeout(Some(Duration::from_secs(60))).ok();
-        let mut wb = WindBot { seat, s, fallbacks: 0, decisions: 0 };
-        wb.expect(CTOS_PLAYER_INFO)?;
-        wb.expect(CTOS_JOIN_GAME)?;
+        wb.s.set_read_timeout(Some(Duration::from_secs(60))).ok();
         // HostInfo as OnJoinGame reads it: banlist, rule, mode, duel_rule, no-check, no-shuffle, pad 3, lp,
         // hand, draw, time limit, pad 4, handshake, version, team sizes, best-of, duel flags, forbidden, extra.
         let mut p = Vec::new();
@@ -122,26 +132,11 @@ impl WindBot {
     }
 
     fn read(&mut self) -> Result<(u8, Vec<u8>), String> {
-        let mut h = [0u8; 2];
-        self.s.read_exact(&mut h).map_err(io("read"))?;
-        let n = u16::from_le_bytes(h) as usize;
-        if n == 0 {
-            return Err("windbot sent an empty packet".into());
-        }
-        let mut b = vec![0u8; n];
-        self.s.read_exact(&mut b).map_err(io("read"))?;
-        Ok((b[0], b[1..].to_vec()))
+        read_on(&mut self.s)
     }
 
     fn expect(&mut self, id: u8) -> Result<Vec<u8>, String> {
-        let (mut got, mut b) = self.read()?;
-        while got == CTOS_CHAT || got == CTOS_TIME_CONFIRM {
-            (got, b) = self.read()?;
-        }
-        if got != id {
-            return Err(format!("windbot sent packet {got:#x}, expected {id:#x}"));
-        }
-        Ok(b)
+        expect_on(&mut self.s, id)
     }
 
     /// MSG_START: who goes first (for this bot), both life points, deck and extra deck sizes.
@@ -259,6 +254,37 @@ impl Drop for WindBot {
     }
 }
 
+fn read_on(s: &mut TcpStream) -> Result<(u8, Vec<u8>), String> {
+    let mut h = [0u8; 2];
+    s.read_exact(&mut h).map_err(io("read"))?;
+    let n = u16::from_le_bytes(h) as usize;
+    if n == 0 {
+        return Err("windbot sent an empty packet".into());
+    }
+    let mut b = vec![0u8; n];
+    s.read_exact(&mut b).map_err(io("read"))?;
+    Ok((b[0], b[1..].to_vec()))
+}
+
+fn expect_on(s: &mut TcpStream, id: u8) -> Result<Vec<u8>, String> {
+    let (mut got, mut b) = read_on(s)?;
+    while got == CTOS_CHAT || got == CTOS_TIME_CONFIRM {
+        (got, b) = read_on(s)?;
+    }
+    if got != id {
+        return Err(format!("windbot sent packet {got:#x}, expected {id:#x}"));
+    }
+    Ok(b)
+}
+
+/// The room password in a CTOS_JOIN_GAME payload as WindBot's GameClient writes it: version (2), padding (2),
+/// room id (4), then 20 UTF-16LE characters, NUL-padded.
+fn join_password(b: &[u8]) -> Option<String> {
+    let raw = b.get(8..48)?;
+    let units: Vec<u16> = raw.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
+    String::from_utf16(&units).ok()
+}
+
 /// Re-encodes a location query: only the fields WindBot reads, and for the opponent's hidden cards
 /// (face-down, or in hand and not revealed) only the position.
 fn filter_query(b: &[u8], opponent: bool, loc: u32) -> Result<Vec<u8>, String> {
@@ -303,4 +329,84 @@ fn filter_query(b: &[u8], opponent: bool, loc: u32) -> Result<Vec<u8>, String> {
         out.extend(QUERY_END.to_le_bytes());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packet(id: u8, payload: &[u8]) -> Vec<u8> {
+        let mut b = ((payload.len() + 1) as u16).to_le_bytes().to_vec();
+        b.push(id);
+        b.extend(payload);
+        b
+    }
+
+    /// CTOS_PLAYER_INFO then CTOS_JOIN_GAME laid out the way WindBot's GameClient writes them.
+    fn join(c: &mut TcpStream, pass: &str) {
+        c.write_all(&packet(CTOS_PLAYER_INFO, &[0u8; 40])).unwrap();
+        let mut j = vec![0x40, 0x13, 0xAA, 0xBB, 0, 0, 0, 0];
+        let mut room = [0u8; 40];
+        for (i, u) in pass.encode_utf16().take(19).enumerate() {
+            room[2 * i..2 * i + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        j.extend(room);
+        j.extend(0x1340u32.to_le_bytes());
+        c.write_all(&packet(CTOS_JOIN_GAME, &j)).unwrap();
+    }
+
+    fn param<'a>(req: &'a str, k: &str) -> &'a str {
+        let q = req.split_whitespace().nth(1).unwrap();
+        q.split(['?', '&']).find_map(|kv| kv.strip_prefix(k)).unwrap()
+    }
+
+    /// A stub WindBot server: answers 200, lets an impostor connect first, then joins with the password it was given.
+    #[test]
+    fn a_loopback_peer_without_the_room_password_is_dropped() {
+        let srv = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = srv.local_addr().unwrap().to_string();
+        let bot = std::thread::spawn(move || {
+            let (mut h, _) = srv.accept().unwrap();
+            let mut req = String::new();
+            let mut buf = [0u8; 1024];
+            while !req.ends_with("\r\n\r\n") {
+                let n = h.read(&mut buf).unwrap();
+                assert!(n > 0, "request cut short: {req:?}");
+                req.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            let (port, pass) = (param(&req, "port=").parse::<u16>().unwrap(), param(&req, "password=").to_string());
+            assert_eq!(pass.len(), ROOM_PASS_LEN);
+            h.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+            drop(h);
+            let mut impostor = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            join(&mut impostor, "not-the-password");
+            let mut rest = Vec::new();
+            impostor.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let _ = impostor.read_to_end(&mut rest);
+            assert!(rest.is_empty(), "the impostor got no STOC_JOIN_GAME");
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            join(&mut c, &pass);
+            assert_eq!(read_on(&mut c).unwrap().0, STOC_JOIN_GAME);
+            c.write_all(&packet(CTOS_UPDATE_DECK, &[])).unwrap();
+            assert_eq!(read_on(&mut c).unwrap(), (STOC_TYPE_CHANGE, vec![1]));
+            c.write_all(&packet(CTOS_HS_READY, &[])).unwrap();
+            assert_eq!(read_on(&mut c).unwrap().0, STOC_DUEL_START);
+            c
+        });
+        let wb = WindBot::connect(&addr, "CyberDragon", 1, "WindBot").unwrap();
+        assert_eq!(wb.seat, 1);
+        drop(bot.join().unwrap());
+    }
+
+    #[test]
+    fn join_password_reads_the_room_field() {
+        let mut j = vec![0u8; 8];
+        let mut room = [0u8; 40];
+        for (i, u) in "abc".encode_utf16().enumerate() {
+            room[2 * i..2 * i + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        j.extend(room);
+        assert_eq!(join_password(&j).as_deref(), Some("abc"));
+        assert_eq!(join_password(&j[..20]), None);
+    }
 }
